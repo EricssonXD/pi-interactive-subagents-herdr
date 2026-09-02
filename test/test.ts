@@ -1086,6 +1086,26 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads explicit extensions from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "extensions-test-agent",
+        [
+          "name: extensions-test-agent",
+          "model: azure-foundry/test",
+          "extensions: /opt/pi/provider.ts, ~/.pi/agent/extensions/helper.ts",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("extensions-test-agent");
+      assert.deepEqual(loaded?.extensions, [
+        "/opt/pi/provider.ts",
+        "~/.pi/agent/extensions/helper.ts",
+      ]);
+    });
+  });
+
   it("loads explicit interactive flag from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1209,7 +1229,8 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("pi-web-access/index.ts"));
+    assert.ok(testApi.getToolExtensionPath("fetch_content")?.endsWith("pi-web-access/index.ts"));
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
@@ -1318,6 +1339,35 @@ describe("subagent discovery", () => {
         parts[toolsIdx + 1].includes("read,write,safe_bash"),
         "expected the tool allowlist as the --tools value",
       );
+    });
+  });
+
+  it("applySandboxToParts loads explicit extensions inside the restricted sandbox", () => {
+    withTempDir((d) => {
+      const extension = join(d, "provider.ts");
+      writeFileSync(extension, "export default () => {};\n");
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        {
+          agent: "scout",
+          toolAllowlist: "read,ask_question",
+          model: "azure-foundry/test",
+          thinking: "low",
+          systemPromptMode: null,
+          identity: null,
+          spawnable: null,
+          autoExit: true,
+          cwd: null,
+          agentDir: null,
+          extensions: [extension],
+        },
+        { artifactDir: d, name: "scout" },
+      );
+
+      const extensionIndex = parts.indexOf("-e");
+      assert.ok(extensionIndex >= 0, "expected explicit extension flag");
+      assert.equal(parts[extensionIndex + 1], `'${extension}'`);
     });
   });
 

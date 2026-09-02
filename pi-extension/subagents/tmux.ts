@@ -284,6 +284,7 @@ export async function pollForExit(
     sessionFile?: string;
     sentinelFile?: string;
     onTick?: (elapsed: number) => void;
+    readScreenAsyncFn?: (surface: string, lines?: number) => Promise<string>;
   },
 ): Promise<PollResult> {
   const start = Date.now();
@@ -316,7 +317,7 @@ export async function pollForExit(
 
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
-      const screen = await readScreenAsync(surface, 5);
+      const screen = await (options.readScreenAsyncFn ?? readScreenAsync)(surface, 5);
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };

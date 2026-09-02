@@ -24,7 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
-} from "./tmux.ts";
+} from "./surface.ts";
 
 import {
   countSessionEntryLines,
@@ -119,6 +119,7 @@ type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 interface AgentDefaults {
   model?: string;
   tools?: string;
+  extensions?: string[];
   skills?: string;
   thinking?: string;
   /**
@@ -216,9 +217,13 @@ function getToolExtensionPath(tool: string): string | undefined {
     return fileURLToPath(import.meta.url);
   }
   const extBase = join(getAgentConfigDir(), "extensions");
+  const webAccess = join(getAgentConfigDir(), "npm", "node_modules", "pi-web-access", "index.ts");
   const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
+    web_search: webAccess,
+    source_check: webAccess,
+    fetch_content: webAccess,
+    get_search_content: webAccess,
+    web_fetch: webAccess,
     video_extract: join(extBase, "video-extract", "index.ts"),
     youtube_search: join(extBase, "youtube-search", "index.ts"),
     google_image_search: join(extBase, "google-image-search", "index.ts"),
@@ -284,6 +289,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
     tools: getFrontmatterValue(frontmatter, "tools"),
+    extensions: parseCommaList(getFrontmatterValue(frontmatter, "extensions")),
     systemPromptMode:
       systemPromptMode === "replace"
         ? "replace"
@@ -508,10 +514,10 @@ function muxUnavailableResult() {
     content: [
       {
         type: "text" as const,
-        text: `Subagents require tmux. ${muxSetupHint()}`,
+        text: `Subagents require Herdr or tmux. ${muxSetupHint()}`,
       },
     ],
-    details: { error: "tmux not available" },
+    details: { error: "no supported multiplexer available" },
   };
 }
 
@@ -858,18 +864,21 @@ function applySandboxToParts(
   }
 
   // Default-deny: disable global extension discovery and re-enable only the
-  // extensions backing the whitelisted tools. A null allowlist means the spawn
-  // was intentionally unrestricted (e.g. a fork clone) and is replayed as-is.
+  // extensions backing the whitelisted tools plus explicitly trusted provider
+  // extensions. A null allowlist means the spawn was intentionally unrestricted.
   if (loadout.toolAllowlist) {
     parts.push("--no-extensions");
     parts.push("--tools", shellEscape(loadout.toolAllowlist));
 
-    const extPaths = new Set<string>();
+    const extPaths = new Set(loadout.extensions ?? []);
     for (const tool of loadout.toolAllowlist.split(",")) {
       const extPath = getToolExtensionPath(tool);
       if (extPath && existsSync(extPath)) extPaths.add(extPath);
     }
     for (const extPath of extPaths) {
+      if (!existsSync(extPath)) {
+        throw new Error(`Configured subagent extension does not exist: ${extPath}`);
+      }
       parts.push("-e", shellEscape(extPath));
     }
   }
@@ -1008,7 +1017,7 @@ function steerSubagent(
   } catch (error: any) {
     return {
       error:
-        `Failed to deliver message to subagent "${running.name}" via tmux: ` +
+        `Failed to deliver message to subagent "${running.name}" via the active multiplexer: ` +
         `${error?.message ?? String(error)}`,
     };
   }
@@ -1341,6 +1350,7 @@ async function launchSubagent(
   const loadout: SubagentLoadout = {
     agent: params.agent ?? null,
     toolAllowlist,
+    extensions: agentDefs?.extensions ?? [],
     model: effectiveModel ?? null,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
