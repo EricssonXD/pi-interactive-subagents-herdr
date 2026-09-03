@@ -1,6 +1,5 @@
 /** Herdr surface layer for Pi sessions running inside Herdr. */
 import { execFile, execFileSync } from "node:child_process";
-import { createConnection } from "node:net";
 import { promisify } from "node:util";
 import { mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -54,12 +53,13 @@ function runJson(args: string[]): any {
 
 type SplitDirection = "right" | "down";
 type LayoutPane = { pane_id: string; rect: { width: number; height: number } };
-type LayoutNode =
-  | { type: "pane"; pane_id: string }
-  | { type: "split"; direction: SplitDirection; ratio: number; first: LayoutNode; second: LayoutNode };
+type PaneInfo = { pane_id: string; tab_id: string; workspace_id: string };
+type Placement = { fromSurface: string; direction: SplitDirection; ratio: number };
 
+const MIN_PANE_WIDTH = 40;
+const MIN_PANE_HEIGHT = 12;
+const BALANCER_PLUGIN_ID = "herdr-pane-balancer";
 const subagentSurfaces = new Set<string>();
-let rebalancePromise: Promise<void> | null = null;
 
 function rootPane(): string {
   return process.env.PI_SUBAGENT_ROOT_PANE ?? process.env.HERDR_PANE_ID!;
@@ -104,143 +104,98 @@ function unregisterSurface(surface: string): void {
   }
 }
 
-function choosePlacement(parent: string): { fromSurface: string; direction: SplitDirection; ratio: number } {
-  const known = knownSurfaces();
-  if (known.size === 0) return { fromSurface: parent, direction: "right", ratio: 0.5 };
-
-  try {
-    const response = runJson(["pane", "layout", "--pane", rootPane()]);
-    const panes = (response?.result?.layout?.panes ?? []) as LayoutPane[];
-    const target = panes
-      .filter((pane) => known.has(pane.pane_id))
-      .reduce<LayoutPane | undefined>(
-        (largest, pane) =>
-          !largest || pane.rect.width * pane.rect.height > largest.rect.width * largest.rect.height
-            ? pane
-            : largest,
-        undefined,
-      );
-    if (target) {
-      return {
-        fromSurface: target.pane_id,
-        direction: target.rect.width >= target.rect.height ? "right" : "down",
-        ratio: 0.5,
-      };
-    }
-  } catch {
-    // Layout is advisory; a normal split is safer than failing a spawn.
-  }
-
-  return { fromSurface: parent, direction: "right", ratio: 0.5 };
+function targetGrid(count: number): { columns: number; rows: number } {
+  const columns = Math.ceil(Math.sqrt(count));
+  return { columns, rows: Math.ceil(count / columns) };
 }
 
-function requestApi(method: string, params: Record<string, unknown>): Promise<any> {
-  const socketPath = process.env.HERDR_SOCKET_PATH;
-  if (!socketPath) return Promise.reject(new Error("HERDR_SOCKET_PATH is not set"));
-
-  return new Promise((resolve, reject) => {
-    const socket = createConnection(socketPath);
-    let buffer = "";
-    socket.setTimeout(5000, () => {
-      socket.destroy();
-      reject(new Error(`Herdr API ${method} timed out`));
-    });
-    socket.on("connect", () => {
-      socket.write(JSON.stringify({ id: `pi-subagents-${Date.now()}`, method, params }) + "\n");
-    });
-    socket.on("data", (chunk) => {
-      buffer += chunk.toString();
-      const newline = buffer.indexOf("\n");
-      if (newline < 0) return;
-      try {
-        const response = JSON.parse(buffer.slice(0, newline));
-        socket.end();
-        if (response.error) reject(new Error(response.error.message ?? "Herdr API request failed"));
-        else resolve(response.result);
-      } catch (error) {
-        socket.destroy();
-        reject(error);
-      }
-    });
-    socket.on("error", reject);
-  });
+function layoutCanFit(width: number, height: number, count: number): boolean {
+  const { columns, rows } = targetGrid(count);
+  return width / columns >= MIN_PANE_WIDTH && height / rows >= MIN_PANE_HEIGHT;
 }
 
-function paneIds(node: LayoutNode): string[] {
-  return node.type === "pane" ? [node.pane_id] : [...paneIds(node.first), ...paneIds(node.second)];
+function chooseSplit(panes: LayoutPane[], managed: Set<string>): Placement | null {
+  const candidates = panes.filter((pane) => managed.has(pane.pane_id));
+  const target = candidates.reduce<LayoutPane | undefined>((best, pane) => {
+    if (!best) return pane;
+    const score = Math.max(pane.rect.width / pane.rect.height, pane.rect.height / pane.rect.width);
+    const bestScore = Math.max(best.rect.width / best.rect.height, best.rect.height / best.rect.width);
+    return score > bestScore ? pane : best;
+  }, undefined);
+  if (!target) return null;
+  return {
+    fromSurface: target.pane_id,
+    direction: target.rect.width >= target.rect.height ? "right" : "down",
+    ratio: 0.5,
+  };
 }
 
-type RatioUpdate = { path: boolean[]; ratio: number };
-
-function collectRatioUpdates(
-  node: LayoutNode,
-  main: string,
-  subagents: Set<string>,
-  path: boolean[] = [],
-  updates: RatioUpdate[] = [],
-): RatioUpdate[] {
-  if (node.type === "pane") return updates;
-
-  const first = paneIds(node.first);
-  const second = paneIds(node.second);
-  const firstHasMain = first.includes(main);
-  const secondHasMain = second.includes(main);
-  const firstIsSubagents = first.every((pane) => subagents.has(pane));
-  const secondIsSubagents = second.every((pane) => subagents.has(pane));
-
-  if (firstHasMain && secondIsSubagents) {
-    updates.push({ path, ratio: 0.4 });
-  } else if (secondHasMain && firstIsSubagents) {
-    updates.push({ path, ratio: 0.6 });
-  } else if (!firstHasMain && !secondHasMain && firstIsSubagents && secondIsSubagents) {
-    updates.push({ path, ratio: first.length / (first.length + second.length) });
-  }
-
-  collectRatioUpdates(node.first, main, subagents, [...path, false], updates);
-  collectRatioUpdates(node.second, main, subagents, [...path, true], updates);
-  return updates;
+function placementForTab(anchor: string, managed: Set<string>, nextCount: number): Placement | null {
+  const response = runJson(["pane", "layout", "--pane", anchor]);
+  const layout = response?.result?.layout;
+  if (!layoutCanFit(layout?.area?.width ?? 0, layout?.area?.height ?? 0, nextCount)) return null;
+  return chooseSplit((layout?.panes ?? []) as LayoutPane[], managed);
 }
 
-async function rebalanceLayout(): Promise<void> {
-  const registry = knownSurfaces();
-  if (!process.env.HERDR_SOCKET_PATH || registry.size === 0) return;
-
-  const exported = await requestApi("layout.export", { pane_id: rootPane() });
-  const layout = exported?.layout;
-  const root = layout?.root as LayoutNode | undefined;
-  if (!root) return;
-
-  const allPanes = paneIds(root);
-  const main = rootPane();
-  const subagents = allPanes.filter((pane) => pane !== main && registry.has(pane));
-  const unrelated = allPanes.filter((pane) => pane !== main && !registry.has(pane));
-  if (!allPanes.includes(main) || unrelated.length > 0) return;
-
-  if (subagents.length === 0) return;
-  for (const update of collectRatioUpdates(root, main, new Set(subagents))) {
-    await requestApi("layout.set_split_ratio", {
-      tab_id: layout.tab_id,
-      path: update.path,
-      ratio: update.ratio,
-    });
+function requirePaneBalancer(): void {
+  const response = runJson(["plugin", "list", "--json"]);
+  const available = (response?.result?.plugins ?? []).some(
+    (plugin: any) => plugin?.plugin_id === BALANCER_PLUGIN_ID && plugin?.enabled === true,
+  );
+  if (!available) {
+    throw new Error(
+      `Herdr subagent tiling requires ${BALANCER_PLUGIN_ID}. Install it with: ` +
+      "herdr plugin install jeph/herdr-pane-balancer --yes",
+    );
   }
 }
 
-export const __layoutTest__ = { collectRatioUpdates, paneIds };
-
-function scheduleRebalance(): void {
-  if (!process.env.HERDR_SOCKET_PATH) return;
-  const next = (rebalancePromise ?? Promise.resolve()).then(rebalanceLayout).catch(() => undefined);
-  rebalancePromise = next;
-  void next.finally(() => {
-    if (rebalancePromise === next) rebalancePromise = null;
-  });
-}
+export const __layoutTest__ = { targetGrid, layoutCanFit, chooseSplit };
 
 export function createSurface(name: string): string {
+  requirePaneBalancer();
   const parent = rootPane();
-  const placement = choosePlacement(parent);
-  return createSurfaceSplit(name, placement.direction, placement.fromSurface, placement.ratio);
+  const rootInfo = runJson(["pane", "get", parent])?.result?.pane as PaneInfo;
+  const panes = (runJson(["pane", "list", "--workspace", rootInfo.workspace_id])?.result?.panes ?? []) as PaneInfo[];
+  const known = knownSurfaces();
+  const tabs = new Map<string, PaneInfo[]>();
+  for (const pane of panes) {
+    const group = tabs.get(pane.tab_id) ?? [];
+    group.push(pane);
+    tabs.set(pane.tab_id, group);
+  }
+
+  const mainPanes = tabs.get(rootInfo.tab_id) ?? [rootInfo];
+  let placement = placementForTab(parent, new Set(mainPanes.map((pane) => pane.pane_id)), mainPanes.length + 1);
+  if (placement) return createSurfaceSplit(name, placement.direction, placement.fromSurface, placement.ratio);
+
+  const overflowTabs = [...tabs.entries()].filter(
+    ([tabId, group]) => tabId !== rootInfo.tab_id && group.some((pane) => known.has(pane.pane_id)),
+  );
+  for (const [, group] of overflowTabs) {
+    placement = placementForTab(
+      group[0].pane_id,
+      new Set(group.map((pane) => pane.pane_id)),
+      group.length + 1,
+    );
+    if (placement) return createSurfaceSplit(name, placement.direction, placement.fromSurface, placement.ratio);
+  }
+
+  const response = runJson([
+    "tab",
+    "create",
+    "--workspace",
+    rootInfo.workspace_id,
+    "--cwd",
+    process.cwd(),
+    "--label",
+    `subagents-${overflowTabs.length + 1}`,
+    "--no-focus",
+  ]);
+  const pane = response?.result?.root_pane?.pane_id;
+  if (typeof pane !== "string" || !pane) throw new Error(`Herdr did not return a pane id while creating ${name}`);
+  registerSurface(pane);
+  return pane;
 }
 
 export function createSurfaceSplit(
@@ -263,7 +218,6 @@ export function createSurfaceSplit(
   const pane = response?.result?.pane?.pane_id;
   if (typeof pane !== "string" || !pane) throw new Error(`Herdr did not return a pane id while creating ${name}`);
   registerSurface(pane);
-  scheduleRebalance();
   return pane;
 }
 
@@ -309,5 +263,4 @@ export function closeSurface(surface: string): void {
   if (surface === rootPane()) throw new Error("Refusing to close the root Pi pane");
   run(["pane", "close", surface]);
   unregisterSurface(surface);
-  scheduleRebalance();
 }

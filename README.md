@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own Herdr or tmux pane without stealing keyboard focus. Herdr keeps one shared root layout across nested spawns: the parent keeps 40% of the tab, while all subagents share the remaining space equally. New panes split the largest subagent cell, then documented `layout.set_split_ratio` updates resize the existing layout in place without replacing live panes. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own Herdr or tmux pane without stealing keyboard focus. Under Herdr, [Herdr Pane Balancer](https://github.com/jeph/herdr-pane-balancer) rebuilds each tab into its tmux-style balanced grid while preserving live panes and row-major order. The extension checks the full tab size before every spawn and opens an unfocused overflow tab when the next grid would make a pane smaller than 40 columns × 12 rows. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Panes are kept evenly sized by the selected backend. tmux uses its `SUBAGENT_TMUX_LAYOUT`; Herdr owns its pane layout.
+Panes are kept evenly sized by the selected backend. tmux uses its `SUBAGENT_TMUX_LAYOUT`; Herdr uses the installed Pane Balancer plugin.
 
 If your shell startup is slow and launch commands get dropped before the prompt is ready, raise the delay:
 
@@ -180,6 +180,8 @@ Status display is configured via `config.json` in the extension directory (copy 
 
 - [pi](https://github.com/badlogic/pi-mono)
 - [Herdr](https://herdr.dev/) (preferred), with Pi running inside a Herdr pane
+- [Herdr Pane Balancer](https://github.com/jeph/herdr-pane-balancer) for Herdr grid retiling:
+  `herdr plugin install jeph/herdr-pane-balancer --yes`
 - [tmux](https://github.com/tmux/tmux) (fallback)
 
 ```bash
