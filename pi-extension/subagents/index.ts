@@ -170,6 +170,14 @@ function getAgentConfigDir(): string {
   return process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 }
 
+// A top-level Pi pane can receive a new Herdr pane id after /reload. Do not
+// retain a child-layout root across reloads; nested agents carry their root
+// explicitly via PI_SUBAGENT_SESSION.
+if (!process.env.PI_SUBAGENT_SESSION) {
+  delete process.env.PI_SUBAGENT_ROOT_PANE;
+  delete process.env.PI_SUBAGENT_SURFACE_REGISTRY;
+}
+
 // ── Runtime tool-extension registration ─────────────────────────────────────
 // `getToolExtensionPath` otherwise only knows a closed set of tool names. Other
 // pi extensions that bundle a tool for subagents (e.g. a project-local
@@ -1194,6 +1202,12 @@ async function launchSubagent(
   const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
+  // Nested agents share the top-level pane and registry so they join the same
+  // balanced layout instead of recursively splitting their own panel.
+  if (!process.env.PI_SUBAGENT_SURFACE_REGISTRY) {
+    process.env.PI_SUBAGENT_SURFACE_REGISTRY = join(artifactDir, "subagent-surfaces");
+  }
+
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
   const targetCwdForSession = effectiveCwd ?? ctx.cwd;
   const sessionDir = getDefaultSessionDirFor(targetCwdForSession, effectiveAgentDir);
@@ -1371,6 +1385,15 @@ async function launchSubagent(
 
   if (resolvedAgentDir) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
+  }
+  const childRootPane = process.env.PI_SUBAGENT_SESSION
+    ? process.env.PI_SUBAGENT_ROOT_PANE
+    : process.env.HERDR_PANE_ID;
+  if (childRootPane) {
+    envParts.push(`PI_SUBAGENT_ROOT_PANE=${shellEscape(childRootPane)}`);
+  }
+  if (process.env.PI_SUBAGENT_SURFACE_REGISTRY) {
+    envParts.push(`PI_SUBAGENT_SURFACE_REGISTRY=${shellEscape(process.env.PI_SUBAGENT_SURFACE_REGISTRY)}`);
   }
 
   if (grantSpawning && agentDefs?.subagentAgents) {

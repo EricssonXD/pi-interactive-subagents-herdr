@@ -6,7 +6,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 ## How it works
 
-`subagent()` returns immediately. The sub-agent runs in its own Herdr or tmux pane — a right split off the parent Pi pane, so pane creation never steals keyboard focus. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
+`subagent()` returns immediately. The sub-agent runs in its own Herdr or tmux pane without stealing keyboard focus. Herdr keeps one shared root layout across nested spawns: the parent keeps 40% of the tab, while all subagents share the remaining space equally. New panes split the largest subagent cell, then documented `layout.set_split_ratio` updates resize the existing layout in place without replacing live panes. A live widget above the input tracks every running sub-agent, and when one finishes, its result is steered into the main session as a notification that triggers a new turn.
 
 ```
 ╭─ Subagents ──────────────────────────── 2 running ─╮
