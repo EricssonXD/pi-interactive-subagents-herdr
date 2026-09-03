@@ -4,13 +4,21 @@
 
 Use this test to verify nested spawning, dynamic tiling, answer validation, parked panes, and coordinated shutdown.
 
+Prerequisite:
+
+```bash
+herdr plugin install jeph/herdr-pane-balancer --yes
+```
+
 ### Expected topology
 
 - 10 Luna agents total: 1 orchestrator plus 9 scouts.
 - The orchestrator spawns exactly one scout every 5 seconds.
 - Use unique names `luna-math-01` through `luna-math-09`.
 - Every scout must use the `scout` profile and `azure-foundry/gpt-5.6-luna`.
-- Watch the Herdr tab while panes are added; each new pane should trigger equal-area retiling without moving or closing the controller pane.
+- Watch the Herdr tab while panes are added; each new pane should trigger the Pane Balancer's tmux-style grid without closing the controller process.
+- Four panes should form 2×2; five should form rows of 3 and 2; six should form 3×2; ten should form rows of 4, 4, and 2.
+- If a target cell would be smaller than 40 columns × 12 rows, the next scout should open in an unfocused `subagents-N` overflow tab instead.
 
 ### Scout jobs
 
