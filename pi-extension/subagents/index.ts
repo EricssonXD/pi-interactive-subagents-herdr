@@ -1136,6 +1136,12 @@ function resolveResumeLaunchBehavior(): { autoExit: boolean; interactive: boolea
   return { autoExit: true, interactive: false };
 }
 
+function commandWithCompletionSidecar(command: string, sessionFile: string): string {
+  const completionFile = `${sessionFile}.complete`;
+  try { unlinkSync(completionFile); } catch {}
+  return `${command}; status=$?; printf '%s\\n' "$status" > ${shellEscape(completionFile)}; echo '__SUBAGENT_DONE_'$status'__'`;
+}
+
 export const __test__ = {
   borderLine,
   getShellReadyDelayMs,
@@ -1158,6 +1164,7 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
+  commandWithCompletionSidecar,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1447,7 +1454,7 @@ async function launchSubagent(
   const cdPrefix = effectiveCwd ? `cd ${shellEscape(effectiveCwd)} && ` : "";
 
   const piCommand = cdPrefix + envPrefix + parts.join(" ");
-  const command = `${piCommand}; echo '__SUBAGENT_DONE_'$?'__'`;
+  const command = commandWithCompletionSidecar(piCommand, subagentSessionFile);
   const launchScriptName = `${(params.name || "subagent")
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, "")
@@ -2245,7 +2252,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // operate where they did before.
         const resumeCdPrefix = loadout.cwd ? `cd ${shellEscape(loadout.cwd)} && ` : "";
 
-        const command = `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}; echo '__SUBAGENT_DONE_'$?'__'`;
+        const command = commandWithCompletionSidecar(
+          `${resumeCdPrefix}${resumeEnvPrefix}${parts.join(" ")}`,
+          sessionPath,
+        );
         const launchScriptFile = join(
           artifactDir,
           "subagent-scripts",

@@ -1,5 +1,6 @@
 import { describe, it, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -30,7 +31,7 @@ import {
   summarizeSessionStats,
 } from "../pi-extension/subagents/session.ts";
 
-import { shellEscape } from "../pi-extension/subagents/tmux.ts";
+import { pollForExit, shellEscape } from "../pi-extension/subagents/tmux.ts";
 import {
   advanceStatusState,
   capStatusLines,
@@ -1788,6 +1789,70 @@ describe("subagent-done.ts", () => {
         rmSync(dir, { recursive: true, force: true });
       }
     });
+  });
+});
+
+describe("tmux.ts completion detection", () => {
+  it("writes the real child exit code to a durable completion sidecar", () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(`${sessionFile}.complete`, "stale");
+    try {
+      const command = (subagentsModule as any).__test__.commandWithCompletionSidecar(
+        "sh -c 'exit 7'",
+        sessionFile,
+      );
+      const output = execFileSync("bash", ["-c", command], { encoding: "utf8" });
+      assert.equal(output.trim(), "__SUBAGENT_DONE_7__");
+      assert.equal(readFileSync(`${sessionFile}.complete`, "utf8").trim(), "7");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("uses a durable completion sidecar when terminal output is mangled", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(`${sessionFile}.complete`, "0\n");
+    try {
+      const result = await pollForExit("pane-1", new AbortController().signal, {
+        interval: 1,
+        sessionFile,
+        readScreenAsyncFn: async () => "__SUBAGENT_DONEbroken",
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+      assert.equal(existsSync(`${sessionFile}.complete`), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates non-zero completion sidecar exit codes", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    writeFileSync(`${sessionFile}.complete`, "7\n");
+    try {
+      assert.deepEqual(
+        await pollForExit("pane-1", new AbortController().signal, {
+          interval: 1,
+          sessionFile,
+          readScreenAsyncFn: async () => "",
+        }),
+        { reason: "sentinel", exitCode: 7 },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a disappeared pane instead of polling forever", async () => {
+    const result = await pollForExit("missing-pane", new AbortController().signal, {
+      interval: 1,
+      readScreenAsyncFn: async () => { throw new Error("pane not found"); },
+    });
+    assert.equal(result.reason, "error");
+    assert.equal(result.exitCode, 1);
+    assert.match(result.errorMessage ?? "", /missing-pane.*unreadable/);
   });
 });
 

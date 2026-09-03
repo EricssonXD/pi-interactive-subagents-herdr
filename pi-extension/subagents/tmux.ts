@@ -243,17 +243,16 @@ export function closeSurface(surface: string): void {
 export interface PollResult {
   /** How the subagent exited */
   reason: "done" | "sentinel" | "error";
-  /** Shell exit code (from sentinel). 0 for file-based exits. */
+  /** Child process exit code. */
   exitCode: number;
   /** Error message if reason is "error" (auto-retry exhausted, provider overload, etc.) */
   errorMessage?: string;
 }
 
 /**
- * Interpret an `.exit` sidecar payload (written by the error path in
- * subagent-done.ts). Centralized so both the fast and slow paths in
- * pollForExit decode the payload the same way. Clean completions write no
- * sidecar and are detected via the terminal sentinel instead.
+ * Interpret an `.exit` sidecar payload written by the agent/provider error
+ * path in subagent-done.ts. Normal process exits use the shell-owned numeric
+ * `.complete` sidecar instead.
  *
  * Note: ask_question does NOT write a `.exit` sidecar — it keeps the session
  * open and signals the parent via a separate `.ask` file (see deliverPendingQuestion).
@@ -269,12 +268,21 @@ function interpretExitSidecar(data: any): PollResult {
   return { reason: "done", exitCode: 0 };
 }
 
-export const __pollForExitTest__ = { interpretExitSidecar };
+function readCompletionSidecar(sessionFile: string): PollResult | null {
+  const completionFile = `${sessionFile}.complete`;
+  if (!existsSync(completionFile)) return null;
+  const value = readFileSync(completionFile, "utf8").trim();
+  if (!/^\d+$/.test(value)) return null; // A concurrent shell write may not be complete yet.
+  rmSync(completionFile, { force: true });
+  return { reason: "sentinel", exitCode: Number(value) };
+}
+
+export const __pollForExitTest__ = { interpretExitSidecar, readCompletionSidecar };
 
 /**
- * Poll until the subagent exits. Checks for a `.exit` sidecar file first
- * (written by the error path), falling back to the terminal sentinel for
- * clean-completion and crash detection.
+ * Poll until the subagent exits. A shell-written `.complete` sidecar is the
+ * authoritative process-exit signal; `.exit` carries agent/provider errors.
+ * Terminal sentinel matching remains a compatibility fallback.
  */
 export async function pollForExit(
   surface: string,
@@ -288,13 +296,22 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
+  let consecutiveReadErrors = 0;
 
   for (;;) {
     if (signal.aborted) {
       throw new Error("Aborted while waiting for subagent to finish");
     }
 
-    // Fast path: check for .exit sidecar file (written by the error path)
+    // Fast path: the shell writes this only after the child process exits.
+    if (options.sessionFile) {
+      try {
+        const completion = readCompletionSidecar(options.sessionFile);
+        if (completion) return completion;
+      } catch {}
+    }
+
+    // Check for .exit sidecar file (written by the agent/provider error path)
     if (options.sessionFile) {
       try {
         const exitFile = `${options.sessionFile}.exit`;
@@ -318,14 +335,17 @@ export async function pollForExit(
     // Slow path: read terminal screen for sentinel (crash detection)
     try {
       const screen = await (options.readScreenAsyncFn ?? readScreenAsync)(surface, 5);
+      consecutiveReadErrors = 0;
       const match = screen.match(/__SUBAGENT_DONE_(\d+)__/);
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
-    } catch {
-      // Surface may have been destroyed — check if .exit file appeared in the meantime
+    } catch (error: any) {
+      // Sidecars can land between the fast-path check and a failed pane read.
       if (options.sessionFile) {
         try {
+          const completion = readCompletionSidecar(options.sessionFile);
+          if (completion) return completion;
           const exitFile = `${options.sessionFile}.exit`;
           if (existsSync(exitFile)) {
             const data = JSON.parse(readFileSync(exitFile, "utf-8"));
@@ -333,6 +353,14 @@ export async function pollForExit(
             return interpretExitSidecar(data);
           }
         } catch {}
+      }
+      consecutiveReadErrors++;
+      if (consecutiveReadErrors >= 5) {
+        return {
+          reason: "error",
+          exitCode: 1,
+          errorMessage: `Subagent surface ${surface} became unreadable before completion: ${error?.message ?? String(error)}`,
+        };
       }
     }
 
