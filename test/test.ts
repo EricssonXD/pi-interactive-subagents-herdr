@@ -12,6 +12,7 @@ import {
   getLeafId,
   getNewEntries,
   countSessionEntryLines,
+  deleteDeliveredSubagentSession,
   getSessionId,
   readNameRegistry,
   readSubagentLoadout,
@@ -389,6 +390,26 @@ describe("session.ts", () => {
       mkdirSync(adir, { recursive: true });
       writeFileSync(nameRegistryPath(adir), "not json{", "utf8");
       assert.deepEqual(readNameRegistry(adir), {});
+    });
+
+    it("deletes a delivered subagent session and its registry entry", () => {
+      const adir = join(dir, "art-cleanup");
+      const sessionFile = join(dir, "delivered.jsonl");
+      writeFileSync(sessionFile, `${JSON.stringify(SESSION_HEADER)}\n`);
+      for (const suffix of [".loadout.json", ".ask", ".exit"]) {
+        writeFileSync(`${sessionFile}${suffix}`, "{}\n");
+      }
+      registerName(adir, "worker", { sessionFile, sessionId: "sess-001" });
+      registerName(adir, "scout", { sessionFile: "/s/scout.jsonl", sessionId: "id-scout" });
+
+      deleteDeliveredSubagentSession(adir, "worker", sessionFile);
+
+      assert.equal(existsSync(sessionFile), false);
+      for (const suffix of [".loadout.json", ".ask", ".exit"]) {
+        assert.equal(existsSync(`${sessionFile}${suffix}`), false);
+      }
+      assert.equal(resolveNameInRegistry(adir, "worker"), null);
+      assert.ok(resolveNameInRegistry(adir, "scout"));
     });
   });
 
@@ -2034,6 +2055,8 @@ describe("tool registration", () => {
     );
     assert.equal(props.sessionId, undefined, "sessionId should be removed");
     assert.equal(props.autoExit, undefined, "autoExit knob should be removed");
+    assert.match(messageTool.description, /session files are deleted/i);
+    assert.doesNotMatch(messageTool.description, /resumes its session/i);
   });
 
   it("no longer registers subagent_interrupt or subagent_resume", () => {
@@ -2449,6 +2472,55 @@ describe("subagent interruption", () => {
     }
   });
 
+  it("deletes sessions only after parent delivery succeeds", () => {
+    withTempDir((dir) => {
+      const artifactDir = join(dir, "artifacts");
+      const delivered = join(dir, "delivered.jsonl");
+      writeFileSync(delivered, `${JSON.stringify(SESSION_HEADER)}\n`);
+      registerName(artifactDir, "worker", { sessionFile: delivered, sessionId: "sess-001" });
+
+      let sent = false;
+      (subagentsModule as any).__test__.deliverResultAndDeleteSession(
+        { sendMessage() { sent = true; } },
+        { customType: "subagent_result", content: "done" },
+        artifactDir,
+        "worker",
+        delivered,
+      );
+      assert.equal(sent, true);
+      assert.equal(existsSync(delivered), false);
+
+      const retained = join(dir, "retained.jsonl");
+      writeFileSync(retained, `${JSON.stringify(SESSION_HEADER)}\n`);
+      registerName(artifactDir, "scout", { sessionFile: retained, sessionId: "sess-002" });
+      assert.throws(() =>
+        (subagentsModule as any).__test__.deliverResultAndDeleteSession(
+          { sendMessage() { throw new Error("parent unavailable"); } },
+          { customType: "subagent_result", content: "done" },
+          artifactDir,
+          "scout",
+          retained,
+        ),
+      );
+      assert.equal(existsSync(retained), true);
+      assert.ok(resolveNameInRegistry(artifactDir, "scout"));
+
+      const parent = join(dir, "parent.jsonl");
+      writeFileSync(parent, `${JSON.stringify(SESSION_HEADER)}\n`);
+      registerName(artifactDir, "bad-entry", { sessionFile: parent, sessionId: "sess-parent" });
+      (subagentsModule as any).__test__.deliverResultAndDeleteSession(
+        { sendMessage() {} },
+        { customType: "subagent_result", content: "done" },
+        artifactDir,
+        "bad-entry",
+        parent,
+        parent,
+      );
+      assert.equal(existsSync(parent), true);
+      assert.ok(resolveNameInRegistry(artifactDir, "bad-entry"));
+    });
+  });
+
   it("formats exit code 130 as an ordinary failure", () => {
     const testApi = (subagentsModule as any).__test__;
     const presentation = testApi.resolveResultPresentation(
@@ -2464,9 +2536,7 @@ describe("subagent interruption", () => {
 
     assert.match(presentation, /failed \(exit code 130\)/);
     assert.doesNotMatch(presentation, /interrupted/);
-    // Follow-ups reference the name (not the session id).
-    assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
-    assert.doesNotMatch(presentation, /Session id:/);
+    assert.doesNotMatch(presentation, /subagent_message|Session id:/);
   });
 
   it("renders a clear provider/agent error when errorMessage is set", () => {
@@ -2491,8 +2561,8 @@ describe("subagent interruption", () => {
     assert.match(presentation, /Sub-agent "Worker" failed/);
     assert.match(presentation, /provider\/agent error — auto-retry exhausted/);
     assert.match(presentation, /Error: Anthropic 529 Overloaded after 3 retries/);
-    assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
-    assert.doesNotMatch(presentation, /Session id:/);
+    assert.match(presentation, /Retry by spawning a new subagent/);
+    assert.doesNotMatch(presentation, /subagent_message|Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
   });
 });

@@ -9,11 +9,12 @@ import {
   readSync,
   readdirSync,
   renameSync,
+  rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 export interface SessionEntry {
   type: string;
@@ -213,6 +214,46 @@ export function resolveNameInRegistry(
 ): NameRegistryEntry | null {
   const entry = readNameRegistry(artifactDir)[name];
   return entry && typeof entry.sessionFile === "string" ? entry : null;
+}
+
+/** Remove a completed session after its result has been queued for the parent. */
+export function deleteDeliveredSubagentSession(
+  artifactDir: string,
+  name: string,
+  sessionFile: string,
+  protectedSessionFile?: string | null,
+): void {
+  try {
+    const registry = readNameRegistry(artifactDir);
+    const target = resolve(sessionFile);
+    if (
+      registry[name]?.sessionFile !== sessionFile ||
+      (protectedSessionFile && target === resolve(protectedSessionFile)) ||
+      Object.entries(registry).some(
+        ([otherName, entry]) => otherName !== name && resolve(entry.sessionFile) === target,
+      )
+    ) return;
+
+    for (const path of [sessionFile, loadoutSidecarPath(sessionFile), `${sessionFile}.ask`, `${sessionFile}.exit`]) {
+      try {
+        rmSync(path, { force: true });
+      } catch {}
+    }
+
+    delete registry[name];
+    const path = nameRegistryPath(artifactDir);
+    if (Object.keys(registry).length === 0) {
+      rmSync(path, { force: true });
+    } else {
+      const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+      writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
+      renameSync(tmp, path);
+    }
+  } catch {
+    // Best-effort cleanup must not turn a delivered result into an error.
+  }
+
+  resetSessionIndexCache();
 }
 
 function readEntries(sessionFile: string): SessionEntry[] {
