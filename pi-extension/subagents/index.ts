@@ -588,6 +588,7 @@ function deliverResultAndDeleteSession(
 ): void {
   pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
   deleteDeliveredSubagentSession(artifactDir, name, sessionFile, protectedSessionFile);
+  publishHerdrChildWork();
 }
 
 /**
@@ -659,6 +660,10 @@ const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-cou
 let latestCtx: ExtensionContext | null = null;
 /** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
+
+function publishHerdrChildWork(): void {
+  latestPi?.events?.emit("herdr:child-work", { count: runningSubagents.size });
+}
 
 /** Interval timer for widget re-renders. */
 let widgetInterval: ReturnType<typeof setInterval> | null = null;
@@ -1164,6 +1169,7 @@ export const __test__ = {
   deliverResultAndDeleteSession,
   resolveResumeLaunchBehavior,
   commandWithCompletionSidecar,
+  publishHerdrChildWork,
   runningSubagents,
   formatElapsed,
   formatTokens,
@@ -1489,6 +1495,7 @@ async function launchSubagent(
   };
 
   runningSubagents.set(id, running);
+  publishHerdrChildWork();
   return running;
 }
 
@@ -2269,6 +2276,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           }),
         };
         runningSubagents.set(id, running);
+        publishHerdrChildWork();
         startWidgetRefresh();
         startStatusRefresh(pi);
 

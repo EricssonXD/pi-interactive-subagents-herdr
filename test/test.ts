@@ -88,13 +88,22 @@ function createMockExtensionApi() {
   const registeredMessageRenderers: Array<any> = [];
   const sentUserMessages: string[] = [];
   const sentMessages: Array<any> = [];
+  const emittedEvents: Array<{ channel: string; data: unknown }> = [];
+  const events = {
+    emit(channel: string, data: unknown) {
+      emittedEvents.push({ channel, data });
+    },
+    on() {},
+  };
   return {
     registeredTools,
     registeredCommands,
     registeredMessageRenderers,
     sentUserMessages,
     sentMessages,
+    emittedEvents,
     api: {
+      events,
       on() {},
       registerTool(tool: any) {
         registeredTools.push(tool);
@@ -1959,6 +1968,31 @@ describe("tool registration", () => {
     });
   });
 
+  it("publishes pending child work for Herdr parent status", () => {
+    const { api, emittedEvents } = createMockExtensionApi();
+    const testApi = (subagentsModule as any).__test__;
+    const previous = new Map(testApi.runningSubagents);
+    testApi.runningSubagents.clear();
+    testApi.runningSubagents.set("child-1", {});
+
+    try {
+      (subagentsModule as any).default(api);
+      testApi.publishHerdrChildWork();
+      assert.deepEqual(emittedEvents.at(-1), {
+        channel: "herdr:child-work",
+        data: { count: 1 },
+      });
+      testApi.runningSubagents.clear();
+      testApi.publishHerdrChildWork();
+      assert.deepEqual(emittedEvents.at(-1), {
+        channel: "herdr:child-work",
+        data: { count: 0 },
+      });
+    } finally {
+      testApi.runningSubagents.clear();
+      for (const [id, running] of previous) testApi.runningSubagents.set(id, running);
+    }
+  });
 
   it("rejects a top-level spawn with no agent and no fork", async () => {
     const { api, registeredTools } = createMockExtensionApi();
