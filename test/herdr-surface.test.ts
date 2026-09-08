@@ -170,6 +170,74 @@ esac
   }
 });
 
+test("keeps separate-mode subagents in one named tab", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-herdr-separate-test-"));
+  const log = join(dir, "calls");
+  const herdr = join(dir, "herdr");
+  writeFileSync(
+    herdr,
+    `#!/bin/sh
+printf '%s\n' "$*" >> '${log}'
+created='${dir}/created'
+case "$1 $2" in
+  "--version") echo 'herdr 0.8.2' ;;
+  "plugin list") echo '{"result":{"plugins":[{"plugin_id":"herdr-pane-balancer","enabled":true}]}}' ;;
+  "pane get") echo '{"result":{"pane":{"pane_id":"w4:p1","tab_id":"w4:t1","workspace_id":"w4"}}}' ;;
+  "tab list")
+    if [ -f "$created" ]; then
+      echo '{"result":{"tabs":[{"tab_id":"w4:t1","workspace_id":"w4","label":"Main"},{"tab_id":"w4:t2","workspace_id":"w4","label":"S Main"}]}}'
+    else
+      echo '{"result":{"tabs":[{"tab_id":"w4:t1","workspace_id":"w4","label":"Main"}]}}'
+    fi
+    ;;
+  "tab get") echo '{"result":{"tab":{"tab_id":"w4:t1","workspace_id":"w4","label":"Main"}}}' ;;
+  "tab create") touch "$created"; echo '{"result":{"tab":{"tab_id":"w4:t2"},"root_pane":{"pane_id":"w4:p2"}}}' ;;
+  "pane list")
+    if [ -f "$created" ]; then
+      echo '{"result":{"panes":[{"pane_id":"w4:p1","tab_id":"w4:t1","workspace_id":"w4"},{"pane_id":"w4:p2","tab_id":"w4:t2","workspace_id":"w4"}]}}'
+    else
+      echo '{"result":{"panes":[{"pane_id":"w4:p1","tab_id":"w4:t1","workspace_id":"w4"}]}}'
+    fi
+    ;;
+  "pane layout") echo '{"result":{"layout":{"panes":[{"pane_id":"w4:p2","rect":{"width":100,"height":50}}]}}}' ;;
+  "pane split") echo '{"result":{"pane":{"pane_id":"w4:p3"}}}' ;;
+  "pane close") ;;
+esac
+`,
+  );
+  chmodSync(herdr, 0o755);
+  const oldEnv = {
+    HERDR_ENV: process.env.HERDR_ENV,
+    HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+    PI_SUBAGENT_LAYOUT_MODE: process.env.PI_SUBAGENT_LAYOUT_MODE,
+    PI_SUBAGENT_SEPARATE_TAB_ID: process.env.PI_SUBAGENT_SEPARATE_TAB_ID,
+    PI_SUBAGENT_SURFACE_REGISTRY: process.env.PI_SUBAGENT_SURFACE_REGISTRY,
+    PATH: process.env.PATH,
+  };
+  process.env.HERDR_ENV = "1";
+  process.env.HERDR_PANE_ID = "w4:p1";
+  process.env.PI_SUBAGENT_LAYOUT_MODE = "separate";
+  delete process.env.PI_SUBAGENT_SEPARATE_TAB_ID;
+  process.env.PI_SUBAGENT_SURFACE_REGISTRY = join(dir, "surfaces");
+  process.env.PATH = `${dir}:${oldEnv.PATH ?? ""}`;
+
+  try {
+    assert.equal(surface.createSurface("worker"), "w4:p2");
+    assert.equal(process.env.PI_SUBAGENT_SEPARATE_TAB_ID, "w4:t2");
+    assert.equal(surface.createSurface("worker-2"), "w4:p3");
+    const calls = readFileSync(log, "utf8");
+    assert.match(calls, /tab create --workspace w4 --cwd .* --label S Main --no-focus/);
+    assert.match(calls, /pane split w4:p2 --direction right --ratio 0\.5 --no-focus/);
+    assert.doesNotMatch(calls, /pane split w4:p1/);
+  } finally {
+    for (const [key, value] of Object.entries(oldEnv)) {
+      if (value === undefined) delete process.env[key as keyof NodeJS.ProcessEnv];
+      else process.env[key as keyof NodeJS.ProcessEnv] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("uses the pane-balancer grid shape and adaptive readability limits", () => {
   const expected = [
     [1, 1], [2, 1], [2, 2], [2, 2], [3, 2],

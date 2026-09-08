@@ -1285,6 +1285,12 @@ async function launchSubagent(
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
+    if (process.env.PI_SUBAGENT_LAYOUT_MODE === "separate") {
+      cmdParts.push("PI_SUBAGENT_LAYOUT_MODE=separate");
+    }
+    if (process.env.PI_SUBAGENT_SEPARATE_TAB_ID) {
+      cmdParts.push(`PI_SUBAGENT_SEPARATE_TAB_ID=${shellEscape(process.env.PI_SUBAGENT_SEPARATE_TAB_ID)}`);
+    }
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
 
@@ -1406,6 +1412,12 @@ async function launchSubagent(
   }
   if (process.env.PI_SUBAGENT_SURFACE_REGISTRY) {
     envParts.push(`PI_SUBAGENT_SURFACE_REGISTRY=${shellEscape(process.env.PI_SUBAGENT_SURFACE_REGISTRY)}`);
+  }
+  if (process.env.PI_SUBAGENT_LAYOUT_MODE === "separate") {
+    envParts.push(`PI_SUBAGENT_LAYOUT_MODE=separate`);
+  }
+  if (process.env.PI_SUBAGENT_SEPARATE_TAB_ID) {
+    envParts.push(`PI_SUBAGENT_SEPARATE_TAB_ID=${shellEscape(process.env.PI_SUBAGENT_SEPARATE_TAB_ID)}`);
   }
 
   if (grantSpawning && agentDefs?.subagentAgents) {
@@ -2215,6 +2227,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (resumeAgentDir) {
           resumeEnvParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resumeAgentDir)}`);
         }
+        if (process.env.PI_SUBAGENT_LAYOUT_MODE === "separate") {
+          resumeEnvParts.push(`PI_SUBAGENT_LAYOUT_MODE=separate`);
+        }
+        if (process.env.PI_SUBAGENT_SEPARATE_TAB_ID) {
+          resumeEnvParts.push(`PI_SUBAGENT_SEPARATE_TAB_ID=${shellEscape(process.env.PI_SUBAGENT_SEPARATE_TAB_ID)}`);
+        }
         if (loadout.spawnable && loadout.spawnable.length > 0) {
           resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
         }
@@ -2350,6 +2368,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         };
       },
     });
+
+  pi.registerCommand("subagent-mode", {
+    description: "Toggle subagent panes between default and separate-tab mode",
+    handler: async (_args, ctx) => {
+      const separate = process.env.PI_SUBAGENT_LAYOUT_MODE !== "separate";
+      if (separate) {
+        process.env.PI_SUBAGENT_LAYOUT_MODE = "separate";
+      } else {
+        delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+      }
+      ctx.ui.notify(
+        `Subagent layout: ${separate ? "separate tab" : "default"}`,
+        "info",
+      );
+    },
+  });
 
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {

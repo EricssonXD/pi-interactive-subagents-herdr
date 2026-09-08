@@ -1950,6 +1950,28 @@ describe("commands", () => {
     assert.match(sentUserMessages[0], /map the auth code/);
   });
 
+  it("toggles the subagent layout mode", async () => {
+    const previousMode = process.env.PI_SUBAGENT_LAYOUT_MODE;
+    const notifications: string[] = [];
+    const { api, registeredCommands } = createMockExtensionApi();
+    api.on = () => {};
+    (subagentsModule as any).default(api);
+    const mode = registeredCommands.find((command) => command.name === "subagent-mode");
+    assert.ok(mode, "expected /subagent-mode to be registered");
+
+    try {
+      delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+      await mode.handler("", { ui: { notify(message: string) { notifications.push(message); } } });
+      assert.equal(process.env.PI_SUBAGENT_LAYOUT_MODE, "separate");
+      await mode.handler("", { ui: { notify(message: string) { notifications.push(message); } } });
+      assert.equal(process.env.PI_SUBAGENT_LAYOUT_MODE, undefined);
+      assert.deepEqual(notifications, ["Subagent layout: separate tab", "Subagent layout: default"]);
+    } finally {
+      if (previousMode === undefined) delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+      else process.env.PI_SUBAGENT_LAYOUT_MODE = previousMode;
+    }
+  });
+
   it("does not register the removed /iterate or /plan commands", () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);

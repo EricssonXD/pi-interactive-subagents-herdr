@@ -54,6 +54,7 @@ function runJson(args: string[]): any {
 type SplitDirection = "right" | "down";
 type LayoutPane = { pane_id: string; rect: { width: number; height: number } };
 type PaneInfo = { pane_id: string; tab_id: string; workspace_id: string };
+type TabInfo = { tab_id: string; workspace_id: string; label?: string };
 type Placement = { fromSurface: string; direction: SplitDirection; ratio: number };
 
 const MIN_PANE_WIDTH = 40;
@@ -152,6 +153,60 @@ function requirePaneBalancer(): void {
 
 export const __layoutTest__ = { targetGrid, layoutCanFit, chooseSplit };
 
+function ensureSeparateTab(rootInfo: PaneInfo, panes: PaneInfo[]): { tabId: string; rootPane: string } {
+  const tabs = (runJson(["tab", "list", "--workspace", rootInfo.workspace_id])?.result?.tabs ?? []) as TabInfo[];
+  const originalLabel = tabs.find((tab) => tab.tab_id === rootInfo.tab_id)?.label || rootInfo.tab_id;
+  const separateTabId = process.env.PI_SUBAGENT_SEPARATE_TAB_ID;
+  const existing = tabs.find(
+    (tab) => tab.tab_id === separateTabId || tab.label === `S ${originalLabel}`,
+  );
+  if (existing) {
+    const existingPane = panes.find((pane) => pane.tab_id === existing.tab_id)?.pane_id;
+    if (existingPane) {
+      process.env.PI_SUBAGENT_SEPARATE_TAB_ID = existing.tab_id;
+      return { tabId: existing.tab_id, rootPane: existingPane };
+    }
+  }
+
+  const response = runJson([
+    "tab",
+    "create",
+    "--workspace",
+    rootInfo.workspace_id,
+    "--cwd",
+    process.cwd(),
+    "--label",
+    `S ${originalLabel}`,
+    "--no-focus",
+  ]);
+  const tabId = response?.result?.tab?.tab_id;
+  const rootPane = response?.result?.root_pane?.pane_id;
+  if (typeof tabId !== "string" || typeof rootPane !== "string") {
+    throw new Error(`Herdr did not return a tab while creating separate subagent mode for ${originalLabel}`);
+  }
+  process.env.PI_SUBAGENT_SEPARATE_TAB_ID = tabId;
+  return { tabId, rootPane };
+}
+
+function createSurfaceInSeparateTab(name: string, rootInfo: PaneInfo, panes: PaneInfo[]): string {
+  const separate = ensureSeparateTab(rootInfo, panes);
+  const managed = panes.filter((pane) => pane.tab_id === separate.tabId);
+  if (managed.length === 0) {
+    registerSurface(separate.rootPane);
+    return separate.rootPane;
+  }
+
+  const layout = runJson(["pane", "layout", "--pane", managed[0].pane_id])?.result?.layout;
+  const placement = chooseSplit(
+    (layout?.panes ?? []) as LayoutPane[],
+    new Set(managed.map((pane) => pane.pane_id)),
+  );
+  if (!placement) {
+    throw new Error(`Herdr separate subagent tab ${separate.tabId} has no pane available for ${name}`);
+  }
+  return createSurfaceSplit(name, placement.direction, placement.fromSurface, placement.ratio);
+}
+
 export function createSurface(name: string): string {
   requirePaneBalancer();
   const parent = rootPane();
@@ -163,6 +218,10 @@ export function createSurface(name: string): string {
     const group = tabs.get(pane.tab_id) ?? [];
     group.push(pane);
     tabs.set(pane.tab_id, group);
+  }
+
+  if (process.env.PI_SUBAGENT_LAYOUT_MODE === "separate") {
+    return createSurfaceInSeparateTab(name, rootInfo, panes);
   }
 
   const mainPanes = tabs.get(rootInfo.tab_id) ?? [rootInfo];
