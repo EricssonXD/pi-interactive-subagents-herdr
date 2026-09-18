@@ -323,3 +323,9 @@ export function closeSurface(surface: string): void {
   run(["pane", "close", surface]);
   unregisterSurface(surface);
 }
+
+export function focusSurface(surface: string): void {
+  const pane = runJson(["pane", "get", surface])?.result?.pane as PaneInfo | undefined;
+  if (!pane?.tab_id) throw new Error(`Herdr did not return a tab for pane ${surface}`);
+  run(["tab", "focus", pane.tab_id]);
+}

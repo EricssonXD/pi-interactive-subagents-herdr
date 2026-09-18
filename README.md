@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Use `/subagent-mode` to toggle Herdr between the default inline layout and separate-tab mode. Separate mode leaves the original tab untouched, puts all subagents in one unfocused tab named `S <original tab label>`, and reuses that tab for nested subagents.
+Use `/subagent` to open the subagent menu. It controls spawning, listing agents, pane layout, and showing or hiding the subagent view. Separate mode leaves the original tab untouched, puts all subagents in one unfocused tab named `S <original tab label>`, and reuses that tab for nested subagents.
 
 Panes are kept evenly sized by the selected backend. tmux uses its `SUBAGENT_TMUX_LAYOUT`; Herdr uses the installed Pane Balancer plugin.
 

@@ -238,6 +238,15 @@ export function closeSurface(surface: string): void {
   rebalanceSurfaces();
 }
 
+export function focusSurface(surface: string): void {
+  requireTmux();
+  const window = execFileSync("tmux", ["display-message", "-p", "-t", surface, "#{window_id}"], {
+    encoding: "utf8",
+  }).trim();
+  execFileSync("tmux", ["select-window", "-t", window], { encoding: "utf8" });
+  execFileSync("tmux", ["select-pane", "-t", surface], { encoding: "utf8" });
+}
+
 // ── Exit polling ──
 
 export interface PollResult {

@@ -2080,20 +2080,50 @@ describe("commands", () => {
     const { api, registeredCommands } = createMockExtensionApi();
     api.on = () => {};
     (subagentsModule as any).default(api);
-    const mode = registeredCommands.find((command) => command.name === "subagent-mode");
-    assert.ok(mode, "expected /subagent-mode to be registered");
+    const mode = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(mode, "expected /subagent to be registered");
 
     try {
       delete process.env.PI_SUBAGENT_LAYOUT_MODE;
-      await mode.handler("", { ui: { notify(message: string) { notifications.push(message); } } });
+      await mode.handler("mode", { ui: { notify(message: string) { notifications.push(message); } } });
       assert.equal(process.env.PI_SUBAGENT_LAYOUT_MODE, "separate");
-      await mode.handler("", { ui: { notify(message: string) { notifications.push(message); } } });
+      await mode.handler("mode", { ui: { notify(message: string) { notifications.push(message); } } });
       assert.equal(process.env.PI_SUBAGENT_LAYOUT_MODE, undefined);
-      assert.deepEqual(notifications, ["Subagent layout: separate tab", "Subagent layout: default"]);
+      assert.deepEqual(notifications, ["Subagent layout: separate tab (hidden)", "Subagent layout: current tab"]);
     } finally {
       if (previousMode === undefined) delete process.env.PI_SUBAGENT_LAYOUT_MODE;
       else process.env.PI_SUBAGENT_LAYOUT_MODE = previousMode;
     }
+  });
+
+  it("opens a unified menu when /subagent has no arguments", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
+
+    let title = "";
+    let options: string[] = [];
+    await subagent.handler("", {
+      ui: {
+        async select(prompt: string, choices: string[]) {
+          title = prompt;
+          options = choices;
+          return undefined;
+        },
+        notify() {},
+      },
+    });
+
+    assert.equal(title, "Subagents");
+    assert.deepEqual(options, [
+      "Spawn subagent",
+      "List available subagents",
+      "Use current tab",
+      "Use separate tab (hidden)",
+      "Show subagent view",
+      "Hide subagent view",
+    ]);
   });
 
   it("does not register the removed /iterate or /plan commands", () => {

@@ -21,6 +21,7 @@ import {
   sendLongCommand,
   pollForExit,
   closeSurface,
+  focusSurface,
   shellEscape,
   readScreen,
 } from "./surface.ts";
@@ -1984,6 +1985,121 @@ async function reconcileChildLifecycles(
   }
 }
 
+function setSubagentLayout(separate: boolean, notify: (message: string) => void): void {
+  if (separate) process.env.PI_SUBAGENT_LAYOUT_MODE = "separate";
+  else delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+  notify(`Subagent layout: ${separate ? "separate tab (hidden)" : "current tab"}`);
+}
+
+function subagentSurfaceForView(ctx: ExtensionContext): string | null {
+  const active = [...runningSubagents.values()].find((running) => running.surface)?.surface;
+  if (active) return active;
+
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
+  if (!parentSessionFile) return null;
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  return listChildLifecycleRecords(artifactDir)
+    .filter((record) => record.parentSessionFile === parentSessionFile && record.status === "running")
+    .at(-1)?.surface ?? null;
+}
+
+function showSubagentView(ctx: ExtensionContext): boolean {
+  const surface = subagentSurfaceForView(ctx);
+  if (!surface) return false;
+  try {
+    focusSurface(surface);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function hideSubagentView(): boolean {
+  const root = process.env.PI_SUBAGENT_ROOT_PANE ?? process.env.HERDR_PANE_ID ?? process.env.TMUX_PANE;
+  if (!root) return false;
+  try {
+    focusSurface(root);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function listSubagents(notify: (message: string) => void): void {
+  const agents = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+  notify(
+    agents.length
+      ? `Available subagents:\n${agents.map((agent) => `• ${agent.name}${agent.description ? ` — ${agent.description}` : ""}`).join("\n")}`
+      : "No subagent definitions found.",
+  );
+}
+
+async function spawnFromCommand(
+  pi: ExtensionAPI,
+  args: string,
+  ctx: ExtensionContext & { ui: any },
+): Promise<void> {
+  const trimmed = args.trim();
+  const spaceIdx = trimmed.indexOf(" ");
+  const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
+  const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+  const defs = loadAgentDefaults(agentName);
+  if (!defs) {
+    ctx.ui.notify(`Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`, "error");
+    return;
+  }
+  const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
+  const displayName = agentName[0].toUpperCase() + agentName.slice(1);
+  pi.sendUserMessage(
+    `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`,
+  );
+}
+
+async function openSubagentMenu(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext & { ui: any },
+): Promise<void> {
+  const choice = await ctx.ui.select("Subagents", [
+    "Spawn subagent",
+    "List available subagents",
+    "Use current tab",
+    "Use separate tab (hidden)",
+    "Show subagent view",
+    "Hide subagent view",
+  ]);
+  if (!choice) return;
+
+  switch (choice) {
+    case "Spawn subagent": {
+      const agents = discoverAgentDefinitions().filter((agent) => !agent.disableModelInvocation);
+      const agentName = await ctx.ui.select("Choose an agent", agents.map((agent) => agent.name));
+      if (!agentName) return;
+      const task = await ctx.ui.input("Task", "What should this subagent do?");
+      await spawnFromCommand(pi, `${agentName}${task?.trim() ? ` ${task.trim()}` : ""}`, ctx);
+      return;
+    }
+    case "List available subagents":
+      listSubagents((message) => ctx.ui.notify(message, "info"));
+      return;
+    case "Use current tab":
+      setSubagentLayout(false, (message) => ctx.ui.notify(message, "info"));
+      return;
+    case "Use separate tab (hidden)":
+      setSubagentLayout(true, (message) => ctx.ui.notify(message, "info"));
+      return;
+    case "Show subagent view": {
+      const ok = showSubagentView(ctx);
+      ctx.ui.notify(ok ? "Subagent view shown" : "No active subagent view found", ok ? "info" : "warning");
+      return;
+    }
+    case "Hide subagent view": {
+      const ok = hideSubagentView();
+      ctx.ui.notify(ok ? "Subagent view hidden" : "Unable to focus the parent pane", ok ? "info" : "warning");
+      return;
+    }
+  }
+}
+
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
   // Capture the UI context for widget updates and reconcile children which
@@ -2739,49 +2855,51 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
-  pi.registerCommand("subagent-mode", {
-    description: "Toggle subagent panes between default and separate-tab mode",
-    handler: async (_args, ctx) => {
-      const separate = process.env.PI_SUBAGENT_LAYOUT_MODE !== "separate";
-      if (separate) {
-        process.env.PI_SUBAGENT_LAYOUT_MODE = "separate";
-      } else {
-        delete process.env.PI_SUBAGENT_LAYOUT_MODE;
-      }
-      ctx.ui.notify(
-        `Subagent layout: ${separate ? "separate tab" : "default"}`,
-        "info",
-      );
-    },
-  });
+  const toggleSubagentMode = async (_args: string, ctx: any) => {
+    const separate = process.env.PI_SUBAGENT_LAYOUT_MODE !== "separate";
+    setSubagentLayout(separate, (message) => ctx.ui.notify(message, "info"));
+  };
 
-  // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
-    description: "Spawn a subagent: /subagent <agent> <task>",
+    description: "Manage subagents, or spawn one with /subagent <agent> <task>",
     handler: async (args, ctx) => {
       const trimmed = args.trim();
       if (!trimmed) {
-        ctx.ui.notify("Usage: /subagent <agent> [task]", "warning");
+        await openSubagentMenu(pi, ctx as any);
         return;
       }
 
-      const spaceIdx = trimmed.indexOf(" ");
-      const agentName = spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx);
-      const task = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
-
-      const defs = loadAgentDefaults(agentName);
-      if (!defs) {
-        ctx.ui.notify(
-          `Agent "${agentName}" not found in ~/.pi/agent/agents/ or .pi/agents/`,
-          "error",
-        );
-        return;
+      const [operation, ...rest] = trimmed.split(/\s+/);
+      const remainder = rest.join(" ");
+      switch (operation.toLowerCase()) {
+        case "list":
+          listSubagents((message) => ctx.ui.notify(message, "info"));
+          return;
+        case "mode":
+          if (remainder === "current" || remainder === "default") {
+            setSubagentLayout(false, (message) => ctx.ui.notify(message, "info"));
+          } else if (remainder === "separate" || remainder === "hidden") {
+            setSubagentLayout(true, (message) => ctx.ui.notify(message, "info"));
+          } else {
+            await toggleSubagentMode("", ctx);
+          }
+          return;
+        case "view": {
+          const action = remainder.toLowerCase() || "show";
+          const ok = action === "hide" ? hideSubagentView() : showSubagentView(ctx);
+          ctx.ui.notify(
+            ok ? `Subagent view ${action === "hide" ? "hidden" : "shown"}` : "Unable to change the subagent view",
+            ok ? "info" : "warning",
+          );
+          return;
+        }
+        case "spawn":
+          await spawnFromCommand(pi, remainder, ctx as any);
+          return;
+        default:
+          // Preserve the original shorthand: /subagent worker do something.
+          await spawnFromCommand(pi, trimmed, ctx as any);
       }
-
-      const taskText = task || `You are the ${agentName} agent. Wait for instructions.`;
-      const displayName = agentName[0].toUpperCase() + agentName.slice(1);
-      const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
-      pi.sendUserMessage(toolCall);
     },
   });
 

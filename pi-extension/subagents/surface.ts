@@ -28,6 +28,7 @@ export const sendLongCommand = (
 export const readScreen = (surface: string, lines?: number) => backend().readScreen(surface, lines);
 export const readScreenAsync = (surface: string, lines?: number) => backend().readScreenAsync(surface, lines);
 export const closeSurface = (surface: string) => backend().closeSurface(surface);
+export const focusSurface = (surface: string) => backend().focusSurface(surface);
 
 export function pollForExit(
   surface: string,
