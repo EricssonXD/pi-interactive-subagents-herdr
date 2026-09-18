@@ -32,6 +32,16 @@ import {
   getNewEntries,
   getSessionId,
   readNameRegistry,
+  type ChildLifecycleRecord,
+  claimChildLifecycleDelivery,
+  clearChildLifecycleDeliveryLock,
+  findChildLifecycleRecord,
+  listChildLifecycleRecords,
+  parentSessionContainsChildResult,
+  readChildLifecycleRecord,
+  removeChildLifecycleRecord,
+  updateChildLifecycleRecord,
+  writeChildLifecycleRecord,
   readSubagentLoadout,
   registerName,
   resolveNameInRegistry,
@@ -578,6 +588,109 @@ function resolveResultPresentation(
     : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}`;
 }
 
+function lifecycleRecordFor(
+  running: RunningSubagent,
+  parentSessionFile: string,
+): ChildLifecycleRecord {
+  return {
+    version: 1,
+    id: running.childId ?? running.id,
+    parentSessionFile,
+    name: running.name,
+    task: running.task,
+    ...(running.agent ? { agent: running.agent } : {}),
+    surface: running.surface,
+    startTime: running.startTime,
+    sessionFile: running.sessionFile,
+    ...(running.launchScriptFile ? { launchScriptFile: running.launchScriptFile } : {}),
+    ...(running.activityFile ? { activityFile: running.activityFile } : {}),
+    ...(running.cli ? { cli: running.cli } : {}),
+    ...(running.sentinelFile ? { sentinelFile: running.sentinelFile } : {}),
+    interactive: running.interactive,
+    status: "running",
+    updatedAt: Date.now(),
+  };
+}
+
+function persistRunningLifecycle(
+  running: RunningSubagent,
+  parentArtifactDir: string,
+  parentSessionFile: string,
+): void {
+  running.childId ??= running.id;
+  running.lifecycleArtifactDir = parentArtifactDir;
+  running.parentSessionFile = parentSessionFile;
+  writeChildLifecycleRecord(lifecycleRecordFor(running, parentSessionFile), parentArtifactDir);
+}
+
+function markRunningCompleted(running: RunningSubagent, result: SubagentResult): void {
+  if (!running.lifecycleArtifactDir || !running.childId) return;
+  updateChildLifecycleRecord(running.lifecycleArtifactDir, running.childId, {
+    status: "completed",
+    result: { ...result, childId: running.childId },
+  });
+}
+
+function runningFromLifecycle(record: ChildLifecycleRecord): RunningSubagent {
+  return {
+    id: record.id,
+    childId: record.id,
+    name: record.name,
+    task: record.task,
+    agent: record.agent,
+    surface: record.surface,
+    startTime: record.startTime,
+    sessionFile: record.sessionFile,
+    launchScriptFile: record.launchScriptFile,
+    activityFile: record.activityFile,
+    lifecycleArtifactDir: undefined,
+    parentSessionFile: record.parentSessionFile,
+    cli: record.cli,
+    sentinelFile: record.sentinelFile,
+    interactive: record.interactive,
+    statusState: createStatusState({ source: record.cli === "claude" ? "claude" : "pi", startTimeMs: record.startTime }),
+  };
+}
+
+function resultFromLifecycle(record: ChildLifecycleRecord): SubagentResult | null {
+  if (!record.result || typeof record.result !== "object") return null;
+  return record.result as unknown as SubagentResult;
+}
+
+function deliverRestoredLifecycle(
+  pi: ExtensionAPI,
+  record: ChildLifecycleRecord,
+  parentArtifactDir: string,
+  parentSessionFile: string,
+): void {
+  const result = resultFromLifecycle(record);
+  if (!result) return;
+  const presentation = resolveResultPresentation(result, record.name);
+  deliverResultAndDeleteSession(
+    pi,
+    {
+      customType: "subagent_result",
+      content: presentation,
+      display: true,
+      details: {
+        id: record.id,
+        name: record.name,
+        task: record.task,
+        ...(record.agent ? { agent: record.agent } : {}),
+        exitCode: result.exitCode,
+        elapsed: result.elapsed,
+        ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+        ...(result.stats ? { stats: result.stats } : {}),
+      },
+    },
+    parentArtifactDir,
+    record.name,
+    record.sessionFile,
+    parentSessionFile,
+    record.id,
+  );
+}
+
 function deliverResultAndDeleteSession(
   pi: Pick<ExtensionAPI, "sendMessage">,
   message: any,
@@ -585,8 +698,36 @@ function deliverResultAndDeleteSession(
   name: string,
   sessionFile: string,
   protectedSessionFile?: string | null,
+  childId?: string,
 ): void {
-  pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+  // Claim before sending so two watchers (for example a stale watcher from a
+  // reload and the reconciled watcher) cannot deliver the same child twice.
+  // If the parent rejects the send, restore the completed state and retain the
+  // session for a later retry.
+  const lifecycle = childId
+    ? readChildLifecycleRecord(join(artifactDir, "subagent-lifecycle", `${childId}.json`))
+    : findChildLifecycleRecord(artifactDir, name, sessionFile);
+  const stableId = childId ?? lifecycle?.id;
+  if (
+    stableId &&
+    protectedSessionFile &&
+    parentSessionContainsChildResult(protectedSessionFile, stableId)
+  ) {
+    updateChildLifecycleRecord(artifactDir, stableId, { status: "delivered" });
+    deleteDeliveredSubagentSession(artifactDir, name, sessionFile, protectedSessionFile);
+    publishHerdrChildWork();
+    return;
+  }
+
+  if (stableId && !claimChildLifecycleDelivery(artifactDir, stableId)) return;
+
+  try {
+    pi.sendMessage(message, { triggerTurn: true, deliverAs: "steer" });
+  } catch (error) {
+    if (stableId) updateChildLifecycleRecord(artifactDir, stableId, { status: "completed" });
+    throw error;
+  }
+  if (stableId) updateChildLifecycleRecord(artifactDir, stableId, { status: "delivered" });
   deleteDeliveredSubagentSession(artifactDir, name, sessionFile, protectedSessionFile);
   publishHerdrChildWork();
 }
@@ -608,6 +749,8 @@ interface SubagentResult {
   errorMessage?: string;
   /** Aggregate usage/model/tool stats parsed from the completed session file. */
   stats?: SessionStats;
+  /** Stable id used by durable lifecycle reconciliation. */
+  childId?: string;
 }
 
 /**
@@ -623,6 +766,10 @@ interface RunningSubagent {
   sessionFile: string;
   launchScriptFile?: string;
   activityFile?: string;
+  /** Parent artifact directory containing the durable lifecycle record. */
+  lifecycleArtifactDir?: string;
+  /** Parent session file used to avoid cross-session reconciliation. */
+  parentSessionFile?: string;
   activity?: SubagentActivityState;
   activityRead?: {
     ok: boolean;
@@ -640,6 +787,8 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /** Stable id is persisted before the child is watched and survives reloads. */
+  childId?: string;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -1322,18 +1471,9 @@ async function launchSubagent(
       .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
     const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
 
-    sendLongCommand(surface, command, {
-      scriptPath: launchScriptFile,
-      scriptPreamble: [
-        `# Claude Code subagent launch script for ${params.name}`,
-        `# Generated: ${new Date().toISOString()}`,
-        `# Surface: ${surface}`,
-      ].join("\n"),
-    });
-
     const running: RunningSubagent = {
       id,
-      name: params.name,
+      name: params.name ?? params.agent ?? "subagent",
       task: params.task,
       agent: params.agent,
       surface,
@@ -1342,6 +1482,9 @@ async function launchSubagent(
       launchScriptFile,
       cli: "claude",
       sentinelFile,
+      childId: id,
+      lifecycleArtifactDir: artifactDir,
+      parentSessionFile: sessionFile,
       interactive: effectiveInteractive,
       statusState: createStatusState({
         source: "claude",
@@ -1349,6 +1492,22 @@ async function launchSubagent(
       }),
     };
 
+    // Persist before typing the command. If the parent dies between pane
+    // creation and child startup, session_start still knows this child exists.
+    persistRunningLifecycle(running, artifactDir, sessionFile);
+    try {
+      sendLongCommand(surface, command, {
+        scriptPath: launchScriptFile,
+        scriptPreamble: [
+          `# Claude Code subagent launch script for ${params.name}`,
+          `# Generated: ${new Date().toISOString()}`,
+          `# Surface: ${surface}`,
+        ].join("\n"),
+      });
+    } catch (error) {
+      removeChildLifecycleRecord(artifactDir, id);
+      throw error;
+    }
     runningSubagents.set(id, running);
     return running;
   }
@@ -1479,19 +1638,9 @@ async function launchSubagent(
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "") || "subagent"}-${id}.sh`;
   const launchScriptFile = join(artifactDir, "subagent-scripts", launchScriptName);
-  sendLongCommand(surface, command, {
-    scriptPath: launchScriptFile,
-    scriptPreamble: [
-      `# Subagent launch script for ${params.name}`,
-      `# Generated: ${new Date().toISOString()}`,
-      `# Session: ${subagentSessionFile}`,
-      `# Surface: ${surface}`,
-    ].join("\n"),
-  });
-
   const running: RunningSubagent = {
     id,
-    name: params.name,
+    name: params.name ?? params.agent ?? "subagent",
     task: params.task,
     agent: params.agent,
     surface,
@@ -1499,6 +1648,9 @@ async function launchSubagent(
     sessionFile: subagentSessionFile,
     launchScriptFile,
     activityFile,
+    childId: id,
+    lifecycleArtifactDir: artifactDir,
+    parentSessionFile: sessionFile,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -1506,6 +1658,23 @@ async function launchSubagent(
     }),
   };
 
+  // Persist before typing the command so a parent restart cannot miss a
+  // child that was created while this process was going down.
+  persistRunningLifecycle(running, artifactDir, sessionFile);
+  try {
+    sendLongCommand(surface, command, {
+      scriptPath: launchScriptFile,
+      scriptPreamble: [
+        `# Subagent launch script for ${params.name}`,
+        `# Generated: ${new Date().toISOString()}`,
+        `# Session: ${subagentSessionFile}`,
+        `# Surface: ${surface}`,
+      ].join("\n"),
+    });
+  } catch (error) {
+    removeChildLifecycleRecord(artifactDir, id);
+    throw error;
+  }
   runningSubagents.set(id, running);
   publishHerdrChildWork();
   return running;
@@ -1607,7 +1776,9 @@ async function watchSubagent(
       closeSurface(surface);
       runningSubagents.delete(running.id);
 
-      return { name, task, summary, exitCode: result.exitCode, elapsed };
+      const childResult = { name, task, summary, exitCode: result.exitCode, elapsed, childId: running.childId };
+      markRunningCompleted(running, childResult);
+      return childResult;
     }
 
     // Pi subagent result extraction
@@ -1635,7 +1806,7 @@ async function watchSubagent(
     closeSurface(surface);
     runningSubagents.delete(running.id);
 
-    return {
+    const childResult: SubagentResult = {
       name,
       task,
       summary,
@@ -1645,7 +1816,10 @@ async function watchSubagent(
       elapsed,
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
+      childId: running.childId,
     };
+    markRunningCompleted(running, childResult);
+    return childResult;
   } catch (err: any) {
     try {
       closeSurface(surface);
@@ -1653,7 +1827,7 @@ async function watchSubagent(
     runningSubagents.delete(running.id);
 
     if (signal.aborted) {
-      return {
+      const childResult: SubagentResult = {
         name,
         task,
         summary: "Subagent cancelled.",
@@ -1661,23 +1835,161 @@ async function watchSubagent(
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
         sessionFile,
+        childId: running.childId,
       };
+      // Abort is the parent shutting down/reloading, not child completion.
+      // Leave the durable record as running for session_start reconciliation.
+      return childResult;
     }
-    return {
+    const childResult: SubagentResult = {
       name,
       task,
       summary: `Subagent error: ${err?.message ?? String(err)}`,
       exitCode: 1,
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
+      childId: running.childId,
     };
+    markRunningCompleted(running, childResult);
+    return childResult;
+  }
+}
+
+function startReconciledChild(
+  pi: ExtensionAPI,
+  record: ChildLifecycleRecord,
+  artifactDir: string,
+  parentSessionFile: string,
+): void {
+  if (record.status === "delivered") {
+    // Delivery is only final once the marker is in the parent transcript. The
+    // process may have crashed after claiming/sending but before updating or
+    // cleaning up the durable record.
+    if (!parentSessionContainsChildResult(parentSessionFile, record.id)) {
+      updateChildLifecycleRecord(artifactDir, record.id, { status: "completed" });
+      record = readChildLifecycleRecord(join(artifactDir, "subagent-lifecycle", `${record.id}.json`)) ?? record;
+      deliverRestoredLifecycle(pi, record, artifactDir, parentSessionFile);
+      return;
+    }
+    deleteDeliveredSubagentSession(artifactDir, record.name, record.sessionFile, parentSessionFile);
+    return;
+  }
+
+  if (record.status === "completed" || record.status === "delivering") {
+    if (record.status === "delivering") {
+      // The previous parent may have crashed after claiming but before
+      // sendMessage. Clear its abandoned lock and re-open the claim so the
+      // durable result is not lost.
+      clearChildLifecycleDeliveryLock(artifactDir, record.id);
+      updateChildLifecycleRecord(artifactDir, record.id, { status: "completed" });
+      record = readChildLifecycleRecord(join(artifactDir, "subagent-lifecycle", `${record.id}.json`)) ?? record;
+    }
+    deliverRestoredLifecycle(pi, record, artifactDir, parentSessionFile);
+    return;
+  }
+
+  if (runningSubagents.has(record.id)) return;
+  const running = runningFromLifecycle(record);
+  running.lifecycleArtifactDir = artifactDir;
+  running.parentSessionFile = parentSessionFile;
+  runningSubagents.set(running.id, running);
+
+  const watcherAbort = new AbortController();
+  running.abortController = watcherAbort;
+  watchSubagent(running, watcherAbort.signal)
+    .then((result) => {
+      // Parent shutdown/reload aborts the watcher but does not cancel the
+      // child. Leave its durable running record for the next session_start.
+      if (result.error === "cancelled") return;
+      updateWidget();
+      deliverResultAndDeleteSession(
+        pi,
+        {
+          customType: "subagent_result",
+          content: resolveResultPresentation(result, running.name),
+          display: true,
+          details: {
+            id: running.childId,
+            name: running.name,
+            task: running.task,
+            ...(running.agent ? { agent: running.agent } : {}),
+            exitCode: result.exitCode,
+            elapsed: result.elapsed,
+            ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+            ...(result.stats ? { stats: result.stats } : {}),
+          },
+        },
+        artifactDir,
+        running.name,
+        running.sessionFile,
+        parentSessionFile,
+        running.childId,
+      );
+    })
+    .catch((error) => {
+      updateWidget();
+      // A watcher error is still a durable completion. Keep the session until
+      // the parent accepts the steer message.
+      const result: SubagentResult = {
+        childId: running.childId,
+        name: running.name,
+        task: running.task,
+        summary: `Subagent error: ${error?.message ?? String(error)}`,
+        exitCode: 1,
+        elapsed: Math.floor((Date.now() - running.startTime) / 1000),
+        error: error?.message ?? String(error),
+      };
+      markRunningCompleted(running, result);
+      deliverResultAndDeleteSession(
+        pi,
+        {
+          customType: "subagent_result",
+          content: resolveResultPresentation(result, running.name),
+          display: true,
+          details: { id: running.childId, name: running.name, task: running.task, error: result.error },
+        },
+        artifactDir,
+        running.name,
+        running.sessionFile,
+        parentSessionFile,
+        running.childId,
+      );
+    });
+}
+
+async function reconcileChildLifecycles(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+): Promise<void> {
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
+  if (!parentSessionFile) return;
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  for (const record of listChildLifecycleRecords(artifactDir)) {
+    if (record.parentSessionFile !== parentSessionFile) continue;
+    if (record.status !== "delivered") {
+      // Repair the name index if the parent stopped between lifecycle
+      // persistence and registerName (or while rewriting the registry).
+      registerName(artifactDir, record.name, {
+        sessionFile: record.sessionFile,
+        sessionId: getSessionId(record.sessionFile),
+        childId: record.id,
+      });
+    }
+    startReconciledChild(pi, record, artifactDir, parentSessionFile);
+  }
+  if (runningSubagents.size > 0) {
+    startWidgetRefresh();
+    startStatusRefresh(pi);
+    publishHerdrChildWork();
   }
 }
 
 export default function subagentsExtension(pi: ExtensionAPI) {
   latestPi = pi;
-  // Capture the UI context for widget updates
-  pi.on("session_start", (_event, ctx) => {
+  // Capture the UI context for widget updates and reconcile children which
+  // outlived the parent process. The lifecycle records are the source of truth;
+  // the in-memory map is only a view used by the widget and steer tool.
+  pi.on("session_start", async (_event, ctx) => {
     latestCtx = ctx;
     // pi runs multiple sessions in one process. A prior session's shutdown
     // aborts the shared module poll-abort controller; install a fresh one so
@@ -1687,6 +1999,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!prevAbort || prevAbort.signal.aborted) {
       (globalThis as any)[POLL_ABORT_KEY] = new AbortController();
     }
+    await reconcileChildLifecycles(pi, ctx);
   });
 
   // Clean up on session shutdown
@@ -1846,6 +2159,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         registerName(parentArtifactDir, running.name, {
           sessionFile: running.sessionFile,
           sessionId: getSessionId(running.sessionFile),
+          childId: running.childId,
         });
 
         // Create a separate AbortController for the watcher
@@ -1860,6 +2174,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // Fire-and-forget: start watching in background
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            // A parent reload aborts supervision only; the child remains
+            // recoverable through its durable lifecycle record.
+            if (result.error === "cancelled") return;
             updateWidget(); // reflect removal from Map immediately
 
             const presentation = resolveResultPresentation(result, running.name);
@@ -1871,6 +2188,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 content: presentation,
                 display: true,
                 details: {
+                  id: running.childId,
                   name: running.name,
                   task: running.task,
                   agent: running.agent,
@@ -1884,6 +2202,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               running.name,
               running.sessionFile,
               parentSessionFile,
+              running.childId,
             );
           })
           .catch((err) => {
@@ -1894,12 +2213,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name: running.name, task: running.task, error: err?.message },
+                details: { id: running.childId, name: running.name, task: running.task, error: err?.message },
               },
               parentArtifactDir,
               running.name,
               running.sessionFile,
               parentSessionFile,
+              running.childId,
             );
           });
 
@@ -2131,6 +2451,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         // Resolve the name to its session file via this session's registry.
         const parentSessionFile = ctx.sessionManager.getSessionFile();
+        if (!parentSessionFile) {
+          const err = "Cannot message a subagent without a persistent parent session.";
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
         const parentArtifactDir = getArtifactDir(
           ctx.sessionManager.getSessionDir(),
           ctx.sessionManager.getSessionId(),
@@ -2154,8 +2478,27 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        // The durable lifecycle record wins over the in-memory map. This is
+        // important immediately after a parent restart: resuming an active
+        // child would open the same jsonl from two processes and corrupt it.
+        const lifecycle = findChildLifecycleRecord(parentArtifactDir, requestedName, sessionPath);
+        if (lifecycle?.status === "running") {
+          startReconciledChild(pi, lifecycle, parentArtifactDir, parentSessionFile ?? "");
+          const restored = runningSubagents.get(lifecycle.id);
+          if (restored) return handleSubagentSteer({ name: restored.name, message: params.message });
+          const err = `Subagent "${requestedName}" is still active and cannot be resumed safely. ` +
+            `Its existing pane will continue to be watched.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err, id: lifecycle.id } };
+        }
+        if (lifecycle?.status === "completed") {
+          startReconciledChild(pi, lifecycle, parentArtifactDir, parentSessionFile ?? "");
+          const err = `Subagent "${requestedName}" has completed; its result is being delivered. ` +
+            `Wait for that result before sending another message.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err, id: lifecycle.id } };
+        }
+
         // Guard: never resume a session that is still running — two processes
-        // mutating the same .jsonl corrupts it. Steer it by name instead.
+        // mutating the same .jsonl corrupt it. Steer it by name instead.
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
@@ -2266,18 +2609,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             .replace(/-+/g, "-")
             .replace(/^-|-$/g, "") || "resume"}-resume-${Date.now()}.sh`,
         );
-        sendLongCommand(surface, command, {
-          scriptPath: launchScriptFile,
-          scriptPreamble: [
-            `# Subagent resume script for ${name}`,
-            `# Generated: ${new Date().toISOString()}`,
-            `# Session: ${sessionPath}`,
-            `# Surface: ${surface}`,
-            ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
-          ].join("\n"),
-        });
-
-        // Register as a running subagent for widget tracking
+        // Register before sending the command so this resume is also
+        // recoverable if the parent exits during pane startup.
         const running: RunningSubagent = {
           id,
           name,
@@ -2287,13 +2620,37 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           sessionFile: sessionPath,
           launchScriptFile,
           activityFile,
+          childId: id,
+          lifecycleArtifactDir: parentArtifactDir,
+          parentSessionFile,
           interactive,
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
           }),
         };
+        persistRunningLifecycle(running, parentArtifactDir, parentSessionFile);
+        try {
+          sendLongCommand(surface, command, {
+            scriptPath: launchScriptFile,
+            scriptPreamble: [
+              `# Subagent resume script for ${name}`,
+              `# Generated: ${new Date().toISOString()}`,
+              `# Session: ${sessionPath}`,
+              `# Surface: ${surface}`,
+              ...(resumeMsgFile ? [`# Resume message file: ${resumeMsgFile}`] : []),
+            ].join("\n"),
+          });
+        } catch (error) {
+          removeChildLifecycleRecord(parentArtifactDir, id);
+          throw error;
+        }
         runningSubagents.set(id, running);
+        registerName(parentArtifactDir, name, {
+          sessionFile: sessionPath,
+          sessionId: resumedSessionId,
+          childId: running.childId,
+        });
         publishHerdrChildWork();
         startWidgetRefresh();
         startStatusRefresh(pi);
@@ -2304,6 +2661,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         watchSubagent(running, watcherAbort.signal)
           .then((result) => {
+            // A parent reload aborts supervision only; the resumed child is
+            // reconciled from its durable lifecycle record later.
+            if (result.error === "cancelled") return;
             updateWidget();
 
             const allEntries = getNewEntries(sessionPath, entryCountBefore);
@@ -2313,10 +2673,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 : result.exitCode !== 0
                   ? `Resumed session exited with code ${result.exitCode}`
                   : "Resumed session exited without new output");
-            const presentation = resolveResultPresentation(
-              { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
-              name,
-            );
+            const resumedResult = {
+              ...result,
+              summary,
+              sessionFile: sessionPath,
+              sessionId: resumedSessionId,
+              childId: running.childId,
+            };
+            // Resume extraction uses only entries added by this follow-up;
+            // replace the watcher's broad summary before durable delivery.
+            markRunningCompleted(running, resumedResult);
+            const presentation = resolveResultPresentation(resumedResult, name);
 
             deliverResultAndDeleteSession(
               pi,
@@ -2325,6 +2692,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 content: presentation,
                 display: true,
                 details: {
+                  id: running.childId,
                   name,
                   task: message,
                   exitCode: result.exitCode,
@@ -2336,6 +2704,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               name,
               sessionPath,
               parentSessionFile,
+              running.childId,
             );
           })
           .catch((err) => {
@@ -2346,12 +2715,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 customType: "subagent_result",
                 content: `Resume error: ${err?.message ?? String(err)}`,
                 display: true,
-                details: { name, error: err?.message },
+                details: { id: running.childId, name, error: err?.message },
               },
               parentArtifactDir,
               name,
               sessionPath,
               parentSessionFile,
+              running.childId,
             );
           });
 

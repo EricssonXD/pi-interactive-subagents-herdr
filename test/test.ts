@@ -30,6 +30,13 @@ import {
   mergeNewEntries,
   seedSubagentSessionFile,
   summarizeSessionStats,
+  childLifecyclePath,
+  childLifecycleDeliveryLockPath,
+  clearChildLifecycleDeliveryLock,
+  listChildLifecycleRecords,
+  readChildLifecycleRecord,
+  writeChildLifecycleRecord,
+  type ChildLifecycleRecord,
 } from "../pi-extension/subagents/session.ts";
 
 import { pollForExit, shellEscape } from "../pi-extension/subagents/tmux.ts";
@@ -369,6 +376,123 @@ describe("session.ts", () => {
       const sf = join(dir, "s3.jsonl");
       writeFileSync(sf + ".loadout.json", "not json{", "utf8");
       assert.equal(readSubagentLoadout(sf), null);
+    });
+  });
+
+  describe("durable child lifecycle", () => {
+    it("retains a completed child for parent restart and cleans its completion sidecar after delivery", () => {
+      withTempDir((dir) => {
+        const artifactDir = join(dir, "artifacts");
+        const sessionFile = join(dir, "child.jsonl");
+        writeFileSync(sessionFile, `${JSON.stringify(SESSION_HEADER)}\n`);
+        writeFileSync(`${sessionFile}.complete`, "0\n");
+        const record: ChildLifecycleRecord = {
+          version: 1,
+          id: "child-stable",
+          parentSessionFile: join(dir, "parent.jsonl"),
+          name: "Worker",
+          task: "finish the task",
+          surface: "pane-1",
+          startTime: 10,
+          sessionFile,
+          interactive: false,
+          status: "completed",
+          updatedAt: 20,
+          result: {
+            childId: "child-stable",
+            name: "Worker",
+            task: "finish the task",
+            summary: "done",
+            exitCode: 0,
+            elapsed: 1,
+          },
+        };
+        writeChildLifecycleRecord(record, artifactDir);
+        assert.equal(listChildLifecycleRecords(artifactDir)[0].id, "child-stable");
+        assert.deepEqual(readChildLifecycleRecord(childLifecyclePath(artifactDir, "child-stable")), record);
+
+        registerName(artifactDir, "Worker", { sessionFile, sessionId: "child-session", childId: record.id });
+        let deliveries = 0;
+        const deliver = (subagentsModule as any).__test__.deliverResultAndDeleteSession;
+        deliver({ sendMessage() { deliveries++; } }, { customType: "subagent_result", content: "done" }, artifactDir, "Worker", sessionFile, null, record.id);
+        // A stale watcher cannot deliver the same stable child twice.
+        deliver({ sendMessage() { deliveries++; } }, { customType: "subagent_result", content: "done" }, artifactDir, "Worker", sessionFile, null, record.id);
+        assert.equal(deliveries, 1);
+        assert.equal(existsSync(`${sessionFile}.complete`), false);
+        assert.equal(readChildLifecycleRecord(childLifecyclePath(artifactDir, record.id))?.status, "delivered");
+      });
+    });
+
+    it("does not lose a result when the parent rejects delivery", () => {
+      withTempDir((dir) => {
+        const artifactDir = join(dir, "artifacts");
+        const sessionFile = join(dir, "child.jsonl");
+        writeFileSync(sessionFile, `${JSON.stringify(SESSION_HEADER)}\n`);
+        const record: ChildLifecycleRecord = {
+          version: 1, id: "child-retry", parentSessionFile: join(dir, "parent.jsonl"),
+          name: "Scout", task: "retry", surface: "pane-2", startTime: 1, sessionFile,
+          interactive: false, status: "completed", updatedAt: 1,
+          result: { name: "Scout", task: "retry", summary: "done", exitCode: 0, elapsed: 1 },
+        };
+        writeChildLifecycleRecord(record, artifactDir);
+        registerName(artifactDir, "Scout", { sessionFile, sessionId: "child-session", childId: record.id });
+        assert.throws(() => (subagentsModule as any).__test__.deliverResultAndDeleteSession(
+          { sendMessage() { throw new Error("parent unavailable"); } },
+          { customType: "subagent_result", content: "done" }, artifactDir, "Scout", sessionFile, null, record.id,
+        ));
+        assert.equal(readChildLifecycleRecord(childLifecyclePath(artifactDir, record.id))?.status, "completed");
+        assert.equal(existsSync(sessionFile), true);
+      });
+    });
+
+    it("recognizes a result already persisted in the parent transcript", () => {
+      withTempDir((dir) => {
+        const artifactDir = join(dir, "artifacts");
+        const sessionFile = join(dir, "child.jsonl");
+        const parentSessionFile = join(dir, "parent.jsonl");
+        writeFileSync(sessionFile, `${JSON.stringify(SESSION_HEADER)}\n`);
+        writeFileSync(parentSessionFile, [
+          JSON.stringify(SESSION_HEADER),
+          JSON.stringify({
+            type: "message",
+            id: "result-entry",
+            message: {
+              role: "custom",
+              customType: "subagent_result",
+              details: { id: "child-already-sent" },
+            },
+          }),
+        ].join("\n") + "\n");
+        const record: ChildLifecycleRecord = {
+          version: 1, id: "child-already-sent", parentSessionFile, name: "Worker",
+          task: "done", surface: "pane-3", startTime: 1, sessionFile,
+          interactive: false, status: "delivering", updatedAt: 1,
+          result: { name: "Worker", task: "done", summary: "done", exitCode: 0, elapsed: 1 },
+        };
+        writeChildLifecycleRecord(record, artifactDir);
+        registerName(artifactDir, "Worker", { sessionFile, sessionId: "child-session", childId: record.id });
+        let sends = 0;
+        (subagentsModule as any).__test__.deliverResultAndDeleteSession(
+          { sendMessage() { sends++; } },
+          { customType: "subagent_result", content: "duplicate" }, artifactDir, "Worker", sessionFile,
+          parentSessionFile, record.id,
+        );
+        assert.equal(sends, 0);
+        assert.equal(readChildLifecycleRecord(childLifecyclePath(artifactDir, record.id))?.status, "delivered");
+        assert.equal(existsSync(sessionFile), false);
+      });
+    });
+
+    it("can clear a delivery lock left by a crashed parent", () => {
+      withTempDir((dir) => {
+        const artifactDir = join(dir, "artifacts");
+        const lock = childLifecycleDeliveryLockPath(artifactDir, "child-lock");
+        mkdirSync(join(artifactDir, "subagent-lifecycle"), { recursive: true });
+        writeFileSync(lock, "stale");
+        assert.equal(existsSync(lock), true);
+        clearChildLifecycleDeliveryLock(artifactDir, "child-lock");
+        assert.equal(existsSync(lock), false);
+      });
     });
   });
 

@@ -161,6 +161,151 @@ export interface NameRegistryEntry {
   sessionFile: string;
   /** Canonical session header id (kept for display/lineage). */
   sessionId: string | null;
+  /** Stable child id used to reconcile a child after the parent restarts. */
+  childId?: string;
+}
+
+export type ChildLifecycleStatus = "running" | "completed" | "delivering" | "delivered";
+
+/** Durable state for one child process owned by a spawner session. */
+export interface ChildLifecycleRecord {
+  version: 1;
+  id: string;
+  parentSessionFile: string;
+  name: string;
+  task: string;
+  agent?: string;
+  surface: string;
+  startTime: number;
+  sessionFile: string;
+  launchScriptFile?: string;
+  activityFile?: string;
+  cli?: string;
+  sentinelFile?: string;
+  interactive: boolean;
+  status: ChildLifecycleStatus;
+  updatedAt: number;
+  result?: Record<string, unknown>;
+}
+
+export function childLifecycleDir(artifactDir: string): string {
+  return join(artifactDir, "subagent-lifecycle");
+}
+
+export function childLifecyclePath(artifactDir: string, childId: string): string {
+  return join(childLifecycleDir(artifactDir), `${childId}.json`);
+}
+
+function writeAtomic(path: string, value: unknown): void {
+  mkdirSync(dirname(path), { recursive: true });
+  const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+  writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  renameSync(tmp, path);
+}
+
+export function writeChildLifecycleRecord(record: ChildLifecycleRecord, artifactDir: string): void {
+  // A child must never be launched without a record the next parent can
+  // reconcile. Let write failures abort the launch before sendLongCommand.
+  writeAtomic(childLifecyclePath(artifactDir, record.id), record);
+}
+
+export function readChildLifecycleRecord(path: string): ChildLifecycleRecord | null {
+  try {
+    const value = JSON.parse(readFileSync(path, "utf8"));
+    if (!value || value.version !== 1 || typeof value.id !== "string" ||
+        typeof value.parentSessionFile !== "string" || typeof value.name !== "string" ||
+        typeof value.sessionFile !== "string" || !["running", "completed", "delivering", "delivered"].includes(value.status)) {
+      return null;
+    }
+    return value as ChildLifecycleRecord;
+  } catch {
+    return null;
+  }
+}
+
+export function listChildLifecycleRecords(artifactDir: string): ChildLifecycleRecord[] {
+  try {
+    return readdirSync(childLifecycleDir(artifactDir))
+      .filter((name) => name.endsWith(".json"))
+      .map((name) => readChildLifecycleRecord(join(childLifecycleDir(artifactDir), name)))
+      .filter((record): record is ChildLifecycleRecord => record !== null);
+  } catch {
+    return [];
+  }
+}
+
+export function findChildLifecycleRecord(
+  artifactDir: string,
+  name: string,
+  sessionFile?: string,
+): ChildLifecycleRecord | null {
+  return listChildLifecycleRecords(artifactDir).find((record) =>
+    record.name === name && (sessionFile == null || resolve(record.sessionFile) === resolve(sessionFile)),
+  ) ?? null;
+}
+
+export function updateChildLifecycleRecord(
+  artifactDir: string,
+  childId: string,
+  update: Partial<ChildLifecycleRecord>,
+): ChildLifecycleRecord | null {
+  const path = childLifecyclePath(artifactDir, childId);
+  const current = readChildLifecycleRecord(path);
+  if (!current) return null;
+  const next = { ...current, ...update, updatedAt: Date.now() } as ChildLifecycleRecord;
+  try { writeAtomic(path, next); } catch { return null; }
+  return next;
+}
+
+/** Claim delivery once. A claimed record prevents duplicate steer messages. */
+export function childLifecycleDeliveryLockPath(artifactDir: string, childId: string): string {
+  return `${childLifecyclePath(artifactDir, childId)}.delivery-lock`;
+}
+
+export function clearChildLifecycleDeliveryLock(artifactDir: string, childId: string): void {
+  try { rmSync(childLifecycleDeliveryLockPath(artifactDir, childId), { force: true }); } catch {}
+}
+
+export function claimChildLifecycleDelivery(artifactDir: string, childId: string): boolean {
+  const path = childLifecyclePath(artifactDir, childId);
+  const lock = childLifecycleDeliveryLockPath(artifactDir, childId);
+  let fd: number | undefined;
+  try {
+    // The lock closes the read/update race between a live watcher and a
+    // reconciled watcher in separate parent processes.
+    fd = openSync(lock, "wx");
+    const current = readChildLifecycleRecord(path);
+    if (!current || current.status === "delivered" || current.status === "delivering") return false;
+    return updateChildLifecycleRecord(artifactDir, childId, { status: "delivering" }) !== null;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) { try { closeSync(fd); } catch {} }
+    try { rmSync(lock, { force: true }); } catch {}
+  }
+}
+
+export function removeChildLifecycleRecord(artifactDir: string, childId: string): void {
+  try { rmSync(childLifecyclePath(artifactDir, childId), { force: true }); } catch {}
+}
+
+/**
+ * Check whether a result marker is already persisted in the parent session.
+ * `sendMessage` is intentionally fire-and-forget in the extension API, so a
+ * parent crash can occur after the custom message is appended but before the
+ * lifecycle record is marked delivered.
+ */
+export function parentSessionContainsChildResult(parentSessionFile: string, childId: string): boolean {
+  try {
+    return readEntries(parentSessionFile).some((entry: any) => {
+      const message = entry?.type === "message" ? entry.message : entry;
+      return message?.role === "custom" &&
+        message?.customType === "subagent_result" &&
+        message?.details?.id === childId;
+    });
+  } catch {
+    return false;
+  }
 }
 
 export type NameRegistry = Record<string, NameRegistryEntry>;
@@ -234,20 +379,30 @@ export function deleteDeliveredSubagentSession(
       )
     ) return;
 
-    for (const path of [sessionFile, loadoutSidecarPath(sessionFile), `${sessionFile}.ask`, `${sessionFile}.exit`]) {
+    for (const path of [
+      sessionFile,
+      loadoutSidecarPath(sessionFile),
+      `${sessionFile}.ask`,
+      `${sessionFile}.exit`,
+      `${sessionFile}.complete`,
+      `${sessionFile}.delivery-lock`,
+    ]) {
       try {
         rmSync(path, { force: true });
       } catch {}
     }
 
+    // Keep the delivered lifecycle tombstone. The stable child id makes
+    // delivery idempotent even if a stale watcher invokes this path again;
+    // session/registry artifacts are still removed below.
     delete registry[name];
-    const path = nameRegistryPath(artifactDir);
+    const registryPath = nameRegistryPath(artifactDir);
     if (Object.keys(registry).length === 0) {
-      rmSync(path, { force: true });
+      rmSync(registryPath, { force: true });
     } else {
-      const tmp = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
+      const tmp = `${registryPath}.tmp-${process.pid}-${Math.random().toString(16).slice(2, 8)}`;
       writeFileSync(tmp, JSON.stringify(registry, null, 2), "utf8");
-      renameSync(tmp, path);
+      renameSync(tmp, registryPath);
     }
   } catch {
     // Best-effort cleanup must not turn a delivered result into an error.
