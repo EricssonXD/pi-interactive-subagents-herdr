@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 
 export type SubagentActivityPhase = "starting" | "active" | "waiting" | "done";
 export type SubagentActivityScope = "agent" | "turn" | "provider" | "streaming" | "tool";
+export type SubagentWaitingReason = "question" | "input" | "children" | "settled" | "aborted" | "unknown";
 
 export type SubagentActivityEvent =
   | "session_start"
@@ -20,6 +21,8 @@ export type SubagentActivityEvent =
   | "tool_execution_update"
   | "tool_result"
   | "tool_execution_end"
+  | "ui_prompt_start"
+  | "ui_prompt_end"
   | "ask_question"
   | "session_shutdown";
 
@@ -38,6 +41,9 @@ export interface SubagentActivityState {
   activeScope?: SubagentActivityScope;
   activeSince?: number;
   waitingSince?: number;
+  waitingReason?: SubagentWaitingReason;
+  uiPromptKind?: string;
+  uiPromptTitle?: string;
   turnIndex?: number;
   messageEventType?: string;
   toolCallId?: string;
@@ -57,7 +63,7 @@ export interface SubagentActivityRecorder {
   input(): void;
   beforeAgentStart(): void;
   agentStart(): void;
-  agentEndWaiting(): void;
+  agentEndWaiting(reason?: SubagentWaitingReason): void;
   agentEndDone(): void;
   turnStart(turnIndex?: number): void;
   turnEnd(turnIndex?: number): void;
@@ -69,6 +75,8 @@ export interface SubagentActivityRecorder {
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
+  uiPromptStart(kind?: string, title?: string): void;
+  uiPromptEnd(kind?: string, title?: string): void;
   askQuestion(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
@@ -77,6 +85,7 @@ const ACTIVITY_UPDATE_THROTTLE_MS = 500;
 const MAX_WRITE_FAILURES = 3;
 const KNOWN_PHASES = new Set<SubagentActivityPhase>(["starting", "active", "waiting", "done"]);
 const KNOWN_SCOPES = new Set<SubagentActivityScope>(["agent", "turn", "provider", "streaming", "tool"]);
+const KNOWN_WAITING_REASONS = new Set<SubagentWaitingReason>(["question", "input", "children", "settled", "aborted", "unknown"]);
 const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "session_start",
   "input",
@@ -93,6 +102,8 @@ const KNOWN_EVENTS = new Set<SubagentActivityEvent>([
   "tool_execution_update",
   "tool_result",
   "tool_execution_end",
+  "ui_prompt_start",
+  "ui_prompt_end",
   "ask_question",
   "session_shutdown",
 ]);
@@ -159,6 +170,12 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
   ) {
     return invalidActivity("unknown activeScope");
   }
+  if (
+    object.waitingReason != null &&
+    (typeof object.waitingReason !== "string" || !KNOWN_WAITING_REASONS.has(object.waitingReason as SubagentWaitingReason))
+  ) {
+    return invalidActivity("unknown waitingReason");
+  }
 
   const validationError = [
     validateFiniteNumber(object, "createdAt"),
@@ -170,6 +187,8 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateBoolean(object, "toolActive"),
     validateOptionalFiniteNumber(object, "activeSince"),
     validateOptionalFiniteNumber(object, "waitingSince"),
+    validateOptionalActivityString(object, "uiPromptKind"),
+    validateOptionalActivityString(object, "uiPromptTitle"),
     validateOptionalInteger(object, "turnIndex"),
     validateOptionalFiniteNumber(object, "toolStartedAt"),
     validateOptionalFiniteNumber(object, "toolEndedAt"),
@@ -236,6 +255,8 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolExecutionUpdate() {},
     toolResult() {},
     toolExecutionEnd() {},
+    uiPromptStart() {},
+    uiPromptEnd() {},
     askQuestion() {},
     sessionShutdown() {},
   };
@@ -248,6 +269,13 @@ function clearActiveState(activity: SubagentActivityState): void {
   activity.toolActive = false;
   delete activity.activeScope;
   delete activity.activeSince;
+}
+
+function clearWaitingDetails(activity: SubagentActivityState): void {
+  delete activity.waitingSince;
+  delete activity.waitingReason;
+  delete activity.uiPromptKind;
+  delete activity.uiPromptTitle;
 }
 
 function refreshActiveScope(activity: SubagentActivityState): void {
@@ -284,7 +312,7 @@ function markActive(
   activity.phase = "active";
   activity.activeScope = scope;
   if (activity.activeSince == null || resetActiveSince) activity.activeSince = now;
-  delete activity.waitingSince;
+  clearWaitingDetails(activity);
 }
 
 export function createSubagentActivityRecorder(params: {
@@ -373,13 +401,13 @@ export function createSubagentActivityRecorder(params: {
     else scheduleFlush();
   }
 
-  function markDone(latestEvent: SubagentActivityEvent): void {
+  function markDone(latestEvent: SubagentActivityEvent, closeRecorder = true): void {
     record(latestEvent, (current) => {
       current.phase = "done";
       clearActiveState(current);
-      delete current.waitingSince;
+      clearWaitingDetails(current);
     }, "immediate");
-    disable();
+    if (closeRecorder) disable();
   }
 
   return {
@@ -387,7 +415,7 @@ export function createSubagentActivityRecorder(params: {
       record("session_start", (current) => {
         current.phase = "starting";
         clearActiveState(current);
-        delete current.waitingSince;
+        clearWaitingDetails(current);
       }, "immediate");
     },
     input() {
@@ -405,15 +433,22 @@ export function createSubagentActivityRecorder(params: {
         markActive(current, "agent", observedAt);
       }, "immediate");
     },
-    agentEndWaiting() {
+    agentEndWaiting(reason: SubagentWaitingReason = "settled") {
       record("agent_end", (current, observedAt) => {
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
+        current.waitingReason = reason;
+        if (reason !== "input") {
+          delete current.uiPromptKind;
+          delete current.uiPromptTitle;
+        }
       }, "immediate");
     },
     agentEndDone() {
-      markDone("agent_end");
+      // Keep recording until session_shutdown. If shutdown gets stuck, the
+      // parent can send one status nudge and observe the response.
+      markDone("agent_end", false);
     },
     turnStart(turnIndex) {
       record("turn_start", (current, observedAt) => {
@@ -493,6 +528,24 @@ export function createSubagentActivityRecorder(params: {
         refreshActiveScope(current);
       }, "immediate");
     },
+    uiPromptStart(kind, title) {
+      record("ui_prompt_start", (current, observedAt) => {
+        current.phase = "waiting";
+        current.waitingSince = observedAt;
+        current.waitingReason = "input";
+        current.uiPromptKind = kind;
+        current.uiPromptTitle = title;
+      }, "immediate");
+    },
+    uiPromptEnd() {
+      record("ui_prompt_end", (current) => {
+        clearWaitingDetails(current);
+        refreshActiveScope(current);
+        if (!current.agentActive && !current.turnActive && !current.providerActive && !current.toolActive) {
+          current.phase = "starting";
+        }
+      }, "immediate");
+    },
     askQuestion() {
       // The subagent paused to ask the orchestrator a question. Park it in the
       // "waiting" phase (do NOT disable the recorder) so the status widget shows
@@ -501,6 +554,9 @@ export function createSubagentActivityRecorder(params: {
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
+        current.waitingReason = "question";
+        delete current.uiPromptKind;
+        delete current.uiPromptTitle;
       }, "immediate");
     },
     sessionShutdown(reason) {

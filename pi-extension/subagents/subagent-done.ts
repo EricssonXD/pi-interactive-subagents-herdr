@@ -233,11 +233,12 @@ export default function (pi: ExtensionAPI) {
     // In both cases the session parks as `waiting` and resumes when the next
     // turn lands.
     const hasPendingChildren = runningChildrenCount() > 0;
+    const turnCanExit = shouldAutoExitOnAgentEnd(userTookOver, messages);
     const shouldExit =
       !awaitingAnswer &&
       !hasPendingChildren &&
       autoExit &&
-      shouldAutoExitOnAgentEnd(userTookOver, messages);
+      turnCanExit;
 
     if (shouldExit) {
       // Surface stopReason: "error" turns (auto-retry exhausted, provider
@@ -268,7 +269,17 @@ export default function (pi: ExtensionAPI) {
       return;
     }
 
-    recorder.agentEndWaiting();
+    recorder.agentEndWaiting(
+      awaitingAnswer
+        ? "question"
+        : hasPendingChildren
+          ? "children"
+          : !turnCanExit
+            ? "aborted"
+            : userTookOver
+              ? "input"
+              : "settled",
+    );
     if (autoExit) {
       // Reset any recorded manual input marker. Auto-exit is decided by whether
       // the latest agent turn completed normally, not by who initiated it.
@@ -314,6 +325,14 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("tool_execution_end", (event) => {
     recorder.toolExecutionEnd((event as any).toolCallId, (event as any).toolName);
+  });
+
+  pi.on("ui_prompt_start", (event) => {
+    recorder.uiPromptStart((event as any).kind, (event as any).title);
+  });
+
+  pi.on("ui_prompt_end", (event) => {
+    recorder.uiPromptEnd((event as any).kind, (event as any).title);
   });
 
   pi.on("session_shutdown", (event) => {

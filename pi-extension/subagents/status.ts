@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
+export const STATUS_NUDGE_AFTER_MS = 60_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
@@ -11,7 +12,8 @@ const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
 const DEFAULT_STATUS_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
 const STATUS_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
-export type SubagentStatusKind = "starting" | "active" | "waiting" | "stalled" | "running";
+export type SubagentStatusKind = "starting" | "active" | "waiting" | "done" | "stalled" | "running";
+export type SubagentWaitingReason = "question" | "input" | "children" | "settled" | "aborted" | "unknown";
 export type SubagentStatusSource = "pi" | "claude";
 export type SubagentStatusTransition = "stalled" | "recovered" | null;
 export type StatusSnapshotState = "unseen" | "present" | "missing" | "invalid" | "wrong-id";
@@ -32,6 +34,9 @@ export type StatusObservation =
       activeScope?: string;
       activeSince?: number;
       waitingSince?: number;
+      waitingReason?: SubagentWaitingReason;
+      uiPromptKind?: string;
+      uiPromptTitle?: string;
       latestEvent?: string;
       activityLabel?: string;
     }
@@ -52,6 +57,9 @@ export interface SubagentStatusState {
   activeSinceMs: number | null;
   activeScope: string | null;
   waitingSinceMs: number | null;
+  waitingReason: SubagentWaitingReason | null;
+  uiPromptKind: string | null;
+  uiPromptTitle: string | null;
   phase: StatusActivityPhase | null;
   latestEvent: string | null;
   activityLabel: string | null;
@@ -70,6 +78,9 @@ export interface StatusSnapshot {
   activeScope: string | null;
   waitingSinceMs: number | null;
   waitingDurationText: string | null;
+  waitingReason: SubagentWaitingReason | null;
+  uiPromptKind: string | null;
+  uiPromptTitle: string | null;
   latestEvent: string | null;
   activityLabel: string | null;
   snapshotState: StatusSnapshotState;
@@ -128,8 +139,9 @@ function boundStatusLine(line: string): string {
   return truncateText(line.replace(/\s+/g, " ").trim(), MAX_STATUS_LINE_LENGTH);
 }
 
-function snapshotProblemLabel(snapshotState: StatusSnapshotState): string | null {
-  if (snapshotState === "wrong-id") return "wrong activity id";
+function snapshotProblemLabel(state: SubagentStatusState): string | null {
+  if (state.snapshotState === "wrong-id") return "wrong activity id";
+  if (state.snapshotError === "status check unanswered") return "status check unanswered";
   return null;
 }
 
@@ -215,6 +227,9 @@ export function createStatusState(params: {
     activeSinceMs: null,
     activeScope: null,
     waitingSinceMs: null,
+    waitingReason: null,
+    uiPromptKind: null,
+    uiPromptTitle: null,
     phase: null,
     latestEvent: null,
     activityLabel: null,
@@ -276,6 +291,9 @@ export function observeStatus(
     activeSinceMs,
     activeScope: activeNow ? observation.activeScope ?? null : null,
     waitingSinceMs,
+    waitingReason: phase === "waiting" ? observation.waitingReason ?? state.waitingReason ?? null : null,
+    uiPromptKind: phase === "waiting" ? observation.uiPromptKind ?? state.uiPromptKind ?? null : null,
+    uiPromptTitle: phase === "waiting" ? observation.uiPromptTitle ?? state.uiPromptTitle ?? null : null,
     phase,
     latestEvent: observation.latestEvent ?? null,
     activityLabel: observation.activityLabel ?? null,
@@ -284,6 +302,50 @@ export function observeStatus(
     snapshotError: null,
     localOverrideAtMs: null,
     localOverrideSequence: null,
+  };
+}
+
+export function forceStatusAfterNudge(state: SubagentStatusState, now: number): SubagentStatusState {
+  if (state.source === "claude") return state;
+
+  return {
+    ...state,
+    firstObservationAtMs: state.firstObservationAtMs ?? now,
+    lastActivityAtMs: now,
+    localOverrideAtMs: now,
+    localOverrideSequence: state.lastActivitySequence,
+    activeNow: false,
+    activeSinceMs: null,
+    activeScope: null,
+    waitingSinceMs: now,
+    waitingReason: "settled",
+    uiPromptKind: null,
+    uiPromptTitle: null,
+    phase: "waiting",
+    latestEvent: "status_nudge",
+    activityLabel: "status check sent",
+    snapshotState: "present",
+    snapshotProblemSinceMs: null,
+    snapshotError: null,
+    currentKind: "waiting",
+  };
+}
+
+export function forceStatusUnresponsive(
+  state: SubagentStatusState,
+  sinceMs: number,
+  observedAt = Date.now(),
+): SubagentStatusState {
+  if (state.source === "claude") return state;
+
+  return {
+    ...state,
+    localOverrideAtMs: observedAt,
+    localOverrideSequence: state.lastActivitySequence,
+    snapshotState: "missing",
+    snapshotProblemSinceMs: sinceMs,
+    snapshotError: "status check unanswered",
+    currentKind: "stalled",
   };
 }
 
@@ -300,6 +362,9 @@ export function forceStatusAfterInterrupt(state: SubagentStatusState, now: numbe
     activeSinceMs: null,
     activeScope: null,
     waitingSinceMs: now,
+    waitingReason: "input",
+    uiPromptKind: null,
+    uiPromptTitle: null,
     phase: "waiting",
     latestEvent: "interrupt_requested",
     activityLabel: "interrupted",
@@ -311,7 +376,7 @@ export function forceStatusAfterInterrupt(state: SubagentStatusState, now: numbe
 }
 
 function classifyProblemState(state: SubagentStatusState, now: number): Pick<StatusSnapshot, "kind" | "statusLabel"> {
-  const problemLabel = snapshotProblemLabel(state.snapshotState);
+  const problemLabel = snapshotProblemLabel(state);
   const hasValidSnapshot = state.lastActivityAtMs != null;
 
   if (!hasValidSnapshot) {
@@ -328,11 +393,13 @@ function classifyProblemState(state: SubagentStatusState, now: number): Pick<Sta
 
   const lastHealthyKind = state.activeNow
     ? "active"
-    : state.waitingSinceMs != null || state.phase === "done"
-      ? "waiting"
-      : state.currentKind === "stalled"
-        ? "starting"
-        : state.currentKind;
+    : state.phase === "done"
+      ? "done"
+      : state.waitingSinceMs != null
+        ? "waiting"
+        : state.currentKind === "stalled"
+          ? "starting"
+          : state.currentKind;
   return { kind: lastHealthyKind, statusLabel: problemLabel };
 }
 
@@ -350,6 +417,9 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
       activeScope: null,
       waitingSinceMs: null,
       waitingDurationText: null,
+      waitingReason: null,
+      uiPromptKind: null,
+      uiPromptTitle: null,
       latestEvent: null,
       activityLabel: null,
       snapshotState: state.snapshotState,
@@ -368,8 +438,8 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     } else if (state.phase === "waiting") {
       kind = "waiting";
     } else if (state.phase === "done") {
-      kind = "waiting";
-      statusLabel = "done";
+      kind = "done";
+      statusLabel = null;
     } else {
       const referenceMs = state.firstObservationAtMs ?? state.startTimeMs;
       const elapsedSinceObservationMs = Math.max(0, now - referenceMs);
@@ -401,6 +471,9 @@ export function classifyStatus(state: SubagentStatusState, now: number): StatusS
     activeScope: state.activeScope,
     waitingSinceMs: state.waitingSinceMs,
     waitingDurationText,
+    waitingReason: state.waitingReason,
+    uiPromptKind: state.uiPromptKind,
+    uiPromptTitle: state.uiPromptTitle,
     latestEvent: state.latestEvent,
     activityLabel: state.activityLabel,
     snapshotState: state.snapshotState,
@@ -422,7 +495,7 @@ export function advanceStatusState(
   const transition =
     state.currentKind !== "stalled" && snapshot.kind === "stalled"
       ? "stalled"
-      : state.currentKind === "stalled" && (snapshot.kind === "active" || snapshot.kind === "waiting")
+      : state.currentKind === "stalled" && (snapshot.kind === "active" || snapshot.kind === "waiting" || snapshot.kind === "done")
         ? "recovered"
         : null;
 
@@ -444,8 +517,19 @@ function formatActiveDetail(snapshot: StatusSnapshot): string {
 }
 
 function formatWaitingDetail(snapshot: StatusSnapshot): string {
+  const reason = snapshot.waitingReason === "question"
+    ? " for orchestrator"
+    : snapshot.waitingReason === "input"
+      ? ` for ${snapshot.uiPromptTitle ?? snapshot.uiPromptKind ?? "input"}`
+      : snapshot.waitingReason === "children"
+        ? " for child results"
+        : snapshot.waitingReason === "settled"
+          ? " after turn"
+          : snapshot.waitingReason === "aborted"
+            ? " after abort"
+            : "";
   const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
-  return `waiting${duration}`;
+  return `waiting${reason}${duration}`;
 }
 
 function formatStalledDetail(snapshot: StatusSnapshot): string {
@@ -471,12 +555,12 @@ export function formatStatusLine(name: string, snapshot: StatusSnapshot): string
   }
 
   if (snapshot.kind === "waiting") {
-    const problem = snapshot.statusLabel && snapshot.statusLabel !== "done"
-      ? ` (${snapshot.statusLabel})`
-      : snapshot.statusLabel === "done"
-        ? " (done)"
-        : "";
+    const problem = snapshot.statusLabel ? ` (${snapshot.statusLabel})` : "";
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatWaitingDetail(snapshot)}${problem}.`);
+  }
+
+  if (snapshot.kind === "done") {
+    return boundStatusLine(`${boundedName} finished ${snapshot.elapsedText}; child process still open.`);
   }
 
   return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, ${formatStalledDetail(snapshot)}.`);
@@ -490,6 +574,9 @@ export function formatTransitionLine(
   const boundedName = normalizeStatusName(name);
 
   if (transition === "recovered") {
+    if (snapshot.kind === "done") {
+      return boundStatusLine(`${boundedName} finished ${snapshot.elapsedText}; child process still open.`);
+    }
     const detail = snapshot.kind === "waiting" ? formatWaitingDetail(snapshot) : formatActiveDetail(snapshot);
     return boundStatusLine(`${boundedName} running ${snapshot.elapsedText}, recovered; ${detail}.`);
   }

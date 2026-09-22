@@ -60,6 +60,9 @@ import {
   classifyStatus,
   createStatusState,
   forceStatusAfterInterrupt,
+  forceStatusAfterNudge,
+  forceStatusUnresponsive,
+  STATUS_NUDGE_AFTER_MS,
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
@@ -549,6 +552,8 @@ function widgetIcon(kind: StatusSnapshot["kind"]): string {
     case "active":
     case "running":
       return `${ICON_YELLOW}⟳${RST}`;
+    case "done":
+      return `${ICON_GREEN}✓${RST}`;
     case "stalled":
       return `${ICON_RED}⟳${RST}`;
     case "waiting":
@@ -605,9 +610,20 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   }
   if (snapshot.kind === "waiting") {
     const duration = snapshot.waitingDurationText ? ` ${snapshot.waitingDurationText}` : "";
-    const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
+    const detail = snapshot.statusLabel
+      ? ` · ${snapshot.statusLabel}`
+      : snapshot.waitingReason === "question"
+        ? " · question"
+        : snapshot.waitingReason === "input"
+          ? ` · ${snapshot.uiPromptTitle ?? snapshot.uiPromptKind ?? "input"}`
+          : snapshot.waitingReason === "children"
+            ? " · child results"
+            : snapshot.waitingReason === "settled"
+              ? " · after turn"
+              : "";
     return ` waiting${duration}${detail} `;
   }
+  if (snapshot.kind === "done") return " done · closing ";
 
   const detail = snapshot.statusLabel ? ` · ${snapshot.statusLabel}` : "";
   const duration = snapshot.snapshotProblemText ? ` ${snapshot.snapshotProblemText}` : "";
@@ -830,6 +846,10 @@ interface RunningSubagent {
   cli?: string;
   sentinelFile?: string;
   statusState: SubagentStatusState;
+  /** Last activity snapshot sequence that received the one-shot status nudge. */
+  statusNudgeSequence?: number;
+  statusNudgeAtMs?: number;
+  statusNudgeUnresponsiveReported?: boolean;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -1139,6 +1159,15 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
 
   if (read.ok) {
     running.activity = read.activity;
+    if (
+      running.statusNudgeSequence != null &&
+      read.activity.sequence > running.statusNudgeSequence &&
+      (read.activity.phase !== "done" || read.activity.latestEvent !== "session_shutdown")
+    ) {
+      running.statusNudgeSequence = undefined;
+      running.statusNudgeAtMs = undefined;
+      running.statusNudgeUnresponsiveReported = false;
+    }
     running.statusState = observeStatus(running.statusState, {
       snapshot: "present",
       updatedAt: read.activity.updatedAt,
@@ -1148,6 +1177,9 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
       activeScope: read.activity.activeScope,
       activeSince: read.activity.activeSince,
       waitingSince: read.activity.waitingSince,
+      waitingReason: read.activity.waitingReason,
+      uiPromptKind: read.activity.uiPromptKind,
+      uiPromptTitle: read.activity.uiPromptTitle,
       latestEvent: read.activity.latestEvent,
       activityLabel: activityLabel(read.activity),
     }, observedAt);
@@ -1279,6 +1311,60 @@ function handleSubagentSteer(
   };
 }
 
+const STATUS_NUDGE_MESSAGE =
+  "Status check only — do not do additional work. If you need information, approval, or a decision, " +
+  "call ask_question now with one clear question. Otherwise state whether the task is complete or failed, " +
+  "then exit now.";
+
+function waitingSinceForNudge(activity: SubagentActivityState): number {
+  return activity.phase === "done"
+    ? activity.updatedAt
+    : activity.waitingSince ?? activity.updatedAt;
+}
+
+function shouldNudgeWaitingSubagent(running: RunningSubagent, now: number): boolean {
+  if (running.interactive || running.cli === "claude" || running.activityRead?.ok !== true) return false;
+  const activity = running.activity;
+  if (!activity || (activity.phase !== "waiting" && activity.phase !== "done")) return false;
+  if (running.statusNudgeSequence === activity.sequence) return false;
+  if (["question", "input", "children", "aborted"].includes(activity.waitingReason ?? "")) return false;
+  return now - waitingSinceForNudge(activity) >= STATUS_NUDGE_AFTER_MS;
+}
+
+function maybeNudgeWaitingSubagent(
+  running: RunningSubagent,
+  now: number,
+  send: (surface: string, command: string) => void = sendCommand,
+): string | null {
+  if (!shouldNudgeWaitingSubagent(running, now)) return null;
+
+  const activity = running.activity!;
+  // One nudge per waiting episode. A newer activity sequence resets this guard.
+  running.statusNudgeSequence = activity.sequence;
+  running.statusNudgeAtMs = now;
+  running.statusNudgeUnresponsiveReported = false;
+
+  const result = steerSubagent(running, STATUS_NUDGE_MESSAGE, send);
+  if ("error" in result) {
+    return `${running.name} status check could not be delivered: ${result.error}`;
+  }
+
+  running.statusState = forceStatusAfterNudge(running.statusState, now);
+  return `${running.name} received a status check after ${formatElapsed(Math.floor((now - waitingSinceForNudge(activity)) / 1000))} of no progress.`;
+}
+
+function maybeMarkStatusUnresponsive(running: RunningSubagent, now: number): string | null {
+  if (
+    running.statusNudgeAtMs == null ||
+    running.statusNudgeUnresponsiveReported ||
+    now - running.statusNudgeAtMs < STATUS_NUDGE_AFTER_MS
+  ) return null;
+
+  running.statusNudgeUnresponsiveReported = true;
+  running.statusState = forceStatusUnresponsive(running.statusState, running.statusNudgeAtMs, now);
+  return `${running.name} did not respond to the status check; the child may be unresponsive.`;
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -1298,6 +1384,11 @@ function startStatusRefresh(pi: ExtensionAPI) {
 
     for (const running of runningSubagents.values()) {
       observeRunningSubagent(running, now);
+      const nudgeLine = maybeNudgeWaitingSubagent(running, now);
+      if (nudgeLine && !running.interactive) transitionLines.push(nudgeLine);
+      const unresponsiveLine = maybeMarkStatusUnresponsive(running, now);
+      if (unresponsiveLine && !running.interactive) transitionLines.push(unresponsiveLine);
+
       const { nextState, snapshot, transition } = advanceStatusState(running.statusState, now);
       if (nextState.currentKind !== running.statusState.currentKind) {
         shouldRefreshWidget = true;
@@ -1374,6 +1465,9 @@ export const __test__ = {
   resolveResumeLaunchBehavior,
   commandWithCompletionSidecar,
   publishHerdrChildWork,
+  shouldNudgeWaitingSubagent,
+  maybeNudgeWaitingSubagent,
+  maybeMarkStatusUnresponsive,
   runningSubagents,
   formatElapsed,
   formatTokens,

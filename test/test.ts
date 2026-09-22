@@ -46,6 +46,8 @@ import {
   classifyStatus,
   createStatusState,
   forceStatusAfterInterrupt,
+  forceStatusAfterNudge,
+  forceStatusUnresponsive,
   formatStatusAggregate,
   formatStatusLine,
   formatTransitionLine,
@@ -964,6 +966,67 @@ describe("status.ts", () => {
     const snapshot = classifyStatus(state, 240_000);
     assert.equal(snapshot.kind, "waiting");
     assert.equal(snapshot.waitingDurationText, "3m");
+  });
+
+  it("distinguishes settled completion from a waiting turn", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 10_000,
+      sequence: 1,
+      phase: "done",
+      latestEvent: "agent_end",
+    }, 10_000);
+
+    const snapshot = classifyStatus(state, 20_000);
+    assert.equal(snapshot.kind, "done");
+    assert.match(formatStatusLine("Worker", snapshot), /finished 20s; child process still open/);
+  });
+
+  it("labels explicit question and UI input waits", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 10_000,
+      sequence: 1,
+      phase: "waiting",
+      waitingSince: 10_000,
+      waitingReason: "question",
+      latestEvent: "ask_question",
+    }, 10_000);
+    assert.match(formatStatusLine("Worker", classifyStatus(state, 20_000)), /waiting for orchestrator/);
+
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 30_000,
+      sequence: 2,
+      phase: "waiting",
+      waitingSince: 30_000,
+      waitingReason: "input",
+      uiPromptKind: "confirm",
+      uiPromptTitle: "Approve edit",
+      latestEvent: "ui_prompt_start",
+    }, 30_000);
+    const snapshot = classifyStatus(state, 31_000);
+    assert.equal(snapshot.uiPromptKind, "confirm");
+    assert.match(formatStatusLine("Worker", snapshot), /waiting for Approve edit/);
+  });
+
+  it("marks an unanswered status nudge as stalled", () => {
+    let state = createStatusState({ source: "pi", startTimeMs: 0 });
+    state = observeStatus(state, {
+      snapshot: "present",
+      updatedAt: 60_000,
+      sequence: 1,
+      phase: "done",
+      latestEvent: "agent_end",
+    }, 60_000);
+    state = forceStatusAfterNudge(state, 120_000);
+    state = forceStatusUnresponsive(state, 120_000, 120_000);
+
+    const snapshot = classifyStatus(state, 180_000);
+    assert.equal(snapshot.kind, "stalled");
+    assert.match(formatStatusLine("Worker", snapshot), /status check unanswered/);
   });
 
   it("uses elapsed-only fallback for claude-backed subagents", () => {
@@ -2488,11 +2551,27 @@ describe("subagent activity snapshots", () => {
 
       recorder.sessionStart();
       currentNow = 3_000;
-      recorder.agentEndWaiting();
+      recorder.agentEndWaiting("settled");
       let read = readSubagentActivityFile(activityFile, "child-2");
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "waiting");
       assert.equal(read.activity.waitingSince, 3_000);
+      assert.equal(read.activity.waitingReason, "settled");
+
+      currentNow = 3_500;
+      recorder.uiPromptStart("confirm", "Approve edit");
+      read = readSubagentActivityFile(activityFile, "child-2");
+      assert.ok(read.ok);
+      assert.equal(read.activity.waitingReason, "input");
+      assert.equal(read.activity.uiPromptKind, "confirm");
+      assert.equal(read.activity.uiPromptTitle, "Approve edit");
+
+      currentNow = 3_750;
+      recorder.uiPromptEnd("confirm", "Approve edit");
+      read = readSubagentActivityFile(activityFile, "child-2");
+      assert.ok(read.ok);
+      assert.equal(read.activity.uiPromptKind, undefined);
+      assert.equal(read.activity.waitingReason, undefined);
 
       currentNow = 4_000;
       recorder.agentEndDone();
@@ -2742,6 +2821,69 @@ describe("subagent interruption", () => {
     });
 
     assert.match(result.error, /Failed to deliver message/);
+  });
+
+  it("nudges an autonomous settled child once after the soft threshold", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning({
+      activityRead: { ok: true },
+      activity: {
+        version: 1,
+        runningChildId: "a1",
+        createdAt: 0,
+        updatedAt: 0,
+        sequence: 1,
+        latestEvent: "agent_end",
+        phase: "done",
+        agentActive: false,
+        turnActive: false,
+        providerActive: false,
+        toolActive: false,
+      },
+      statusState: observeStatus(
+        createStatusState({ source: "pi", startTimeMs: 0 }),
+        { snapshot: "present", updatedAt: 0, sequence: 1, phase: "done", latestEvent: "agent_end" },
+        0,
+      ),
+    });
+    const sent: string[] = [];
+
+    const first = testApi.maybeNudgeWaitingSubagent(running, 60_000, (_surface: string, text: string) => {
+      sent.push(text);
+    });
+    const second = testApi.maybeNudgeWaitingSubagent(running, 61_000, (_surface: string, text: string) => {
+      sent.push(text);
+    });
+
+    assert.match(first, /status check/);
+    assert.equal(second, null);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /ask_question/);
+    assert.equal(running.statusNudgeSequence, 1);
+  });
+
+  it("does not nudge an explicit question wait", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning({
+      activityRead: { ok: true },
+      activity: {
+        version: 1,
+        runningChildId: "a1",
+        createdAt: 0,
+        updatedAt: 0,
+        sequence: 1,
+        latestEvent: "ask_question",
+        phase: "waiting",
+        waitingSince: 0,
+        waitingReason: "question",
+        agentActive: false,
+        turnActive: false,
+        providerActive: false,
+        toolActive: false,
+      },
+    });
+
+    assert.equal(testApi.maybeNudgeWaitingSubagent(running, 60_000, () => {}), null);
   });
 
   it("delivers a steer message and forces local status waiting", () => {

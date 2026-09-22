@@ -169,7 +169,7 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Status widget & configuration
 
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (open for input or another stage), `stalled` (no valid snapshot for too long), or `running` (fallback). `stalled` is observational only: unreadable panes and missing snapshots never kill a child; durable completion/error sidecars are required before cleanup. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
+The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (with `question`, `input`, `child results`, or `after turn` detail), `done` (the agent finished but the child process is still closing), `stalled` (no valid snapshot or unanswered status check), or `running` (fallback). After an autonomous child is settled for 60 seconds without exiting, the parent sends one status-only nudge: use `ask_question` if input is needed, otherwise report completion/failure and exit. This never kills the child or retries work; an unanswered nudge becomes observational `stalled`. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
 
