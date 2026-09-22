@@ -1474,6 +1474,72 @@ describe("subagent discovery", () => {
     );
   });
 
+  it("aggregates subagent metrics by agent and model", () => {
+    const records = [
+      {
+        version: 1,
+        id: "child-1",
+        parentSessionFile: "/parent.jsonl",
+        name: "Scout",
+        task: "inspect",
+        agent: "scout",
+        surface: "pane-1",
+        startTime: 1,
+        sessionFile: "/scout.jsonl",
+        model: "azure-foundry/gpt-5.6-luna",
+        interactive: false,
+        status: "delivered",
+        updatedAt: 2,
+        result: {
+          exitCode: 0,
+          elapsed: 10,
+          stats: {
+            model: "azure-foundry/gpt-5.6-luna",
+            toolCount: 2,
+            inputTokens: 100,
+            outputTokens: 20,
+            cost: 0.25,
+            costKnown: true,
+          },
+        },
+      },
+      {
+        version: 1,
+        id: "child-2",
+        parentSessionFile: "/parent.jsonl",
+        name: "Worker",
+        task: "edit",
+        agent: "worker",
+        surface: "pane-2",
+        startTime: 1,
+        sessionFile: "/worker.jsonl",
+        model: "azure-foundry/gpt-5.6-sol",
+        interactive: false,
+        status: "delivered",
+        updatedAt: 2,
+        result: {
+          exitCode: 1,
+          elapsed: 20,
+          stats: {
+            model: "azure-foundry/gpt-5.6-sol",
+            toolCount: 3,
+            inputTokens: 200,
+            outputTokens: 40,
+            cost: 0,
+            costKnown: false,
+          },
+        },
+      },
+    ];
+    const metrics = testApi.summarizeSubagentMetrics(records);
+    assert.equal(metrics.runs, 2);
+    assert.equal(metrics.failed, 1);
+    assert.equal(metrics.cost, 0.25);
+    assert.equal(metrics.costKnownRuns, 1);
+    assert.equal(metrics.byAgent.get("scout").runs, 1);
+    assert.equal(metrics.byModel.get("azure-foundry/gpt-5.6-sol").failed, 1);
+  });
+
   it("resolves session mode from frontmatter (standalone default)", () => {
     assert.equal(testApi.resolveEffectiveSessionMode({ name: "A", task: "T" }, null), "standalone");
     assert.equal(
@@ -2207,6 +2273,7 @@ describe("commands", () => {
     assert.deepEqual(options, [
       "Spawn subagent",
       "List available subagents",
+      "View metrics",
       "Use current tab",
       "Use separate tab (hidden)",
       "Show subagent view",

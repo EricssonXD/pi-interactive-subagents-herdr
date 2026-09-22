@@ -1356,6 +1356,8 @@ export const __test__ = {
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
   resolveEffectiveModel,
+  summarizeSubagentMetrics,
+  formatSubagentMetrics,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -2111,6 +2113,148 @@ function listSubagents(notify: (message: string) => void): void {
   );
 }
 
+interface MetricBucket {
+  runs: number;
+  failed: number;
+  elapsedSeconds: number;
+  inputTokens: number;
+  outputTokens: number;
+  toolCount: number;
+  cost: number;
+  costKnownRuns: number;
+}
+
+interface SubagentMetrics extends MetricBucket {
+  byAgent: Map<string, MetricBucket>;
+  byModel: Map<string, MetricBucket>;
+}
+
+function emptyMetricBucket(): MetricBucket {
+  return {
+    runs: 0,
+    failed: 0,
+    elapsedSeconds: 0,
+    inputTokens: 0,
+    outputTokens: 0,
+    toolCount: 0,
+    cost: 0,
+    costKnownRuns: 0,
+  };
+}
+
+function addMetricBucket(target: MetricBucket, record: ChildLifecycleRecord): void {
+  const result = record.result as Record<string, any> | undefined;
+  if (!result) return;
+
+  const stats = result.stats as Partial<SessionStats> | undefined;
+  const costKnown = stats?.costKnown === true ||
+    (stats?.costKnown === undefined && typeof stats?.cost === "number" && stats.cost > 0);
+  const values = {
+    elapsedSeconds: typeof result.elapsed === "number" ? result.elapsed : 0,
+    inputTokens: typeof stats?.inputTokens === "number" ? stats.inputTokens : 0,
+    outputTokens: typeof stats?.outputTokens === "number" ? stats.outputTokens : 0,
+    toolCount: typeof stats?.toolCount === "number" ? stats.toolCount : 0,
+    cost: typeof stats?.cost === "number" ? stats.cost : 0,
+  };
+
+  target.runs++;
+  target.failed += result.exitCode !== 0 || !!result.error || !!result.errorMessage ? 1 : 0;
+  target.elapsedSeconds += values.elapsedSeconds;
+  target.inputTokens += values.inputTokens;
+  target.outputTokens += values.outputTokens;
+  target.toolCount += values.toolCount;
+  target.cost += values.cost;
+  if (costKnown) target.costKnownRuns++;
+}
+
+function collectMetricRecords(
+  artifactDir: string,
+  parentSessionFile: string,
+  visited = new Set<string>(),
+): ChildLifecycleRecord[] {
+  const key = resolve(artifactDir);
+  if (visited.has(key)) return [];
+  visited.add(key);
+
+  const records = listChildLifecycleRecords(artifactDir).filter(
+    (record) => record.parentSessionFile === parentSessionFile,
+  );
+  const nested: ChildLifecycleRecord[] = [];
+  for (const record of records) {
+    const result = record.result as Record<string, any> | undefined;
+    const childSessionId =
+      (typeof result?.sessionId === "string" ? result.sessionId : null) ??
+      (existsSync(record.sessionFile) ? getSessionId(record.sessionFile) : null);
+    if (!childSessionId) continue;
+    nested.push(
+      ...collectMetricRecords(
+        join(dirname(record.sessionFile), "artifacts", childSessionId),
+        record.sessionFile,
+        visited,
+      ),
+    );
+  }
+  return [...records, ...nested];
+}
+
+function summarizeSubagentMetrics(records: ChildLifecycleRecord[]): SubagentMetrics {
+  const metrics: SubagentMetrics = { ...emptyMetricBucket(), byAgent: new Map(), byModel: new Map() };
+  for (const record of records) {
+    if (!record.result) continue;
+    addMetricBucket(metrics, record);
+
+    const agent = record.agent ?? "unknown agent";
+    const model = record.model ??
+      (record.result as Record<string, any>).model ??
+      ((record.result as Record<string, any>).stats as SessionStats | undefined)?.model ??
+      "unknown model";
+    const agentBucket = metrics.byAgent.get(agent) ?? emptyMetricBucket();
+    const modelBucket = metrics.byModel.get(model) ?? emptyMetricBucket();
+    addMetricBucket(agentBucket, record);
+    addMetricBucket(modelBucket, record);
+    metrics.byAgent.set(agent, agentBucket);
+    metrics.byModel.set(model, modelBucket);
+  }
+  return metrics;
+}
+
+function formatMetricCost(bucket: MetricBucket): string {
+  if (bucket.costKnownRuns === 0) return "cost unavailable";
+  const partial = bucket.costKnownRuns < bucket.runs
+    ? `, known ${bucket.costKnownRuns}/${bucket.runs}`
+    : "";
+  return `$${bucket.cost.toFixed(3)}${partial}`;
+}
+
+function formatMetricBucket(label: string, bucket: MetricBucket): string {
+  const average = bucket.runs > 0 ? Math.round(bucket.elapsedSeconds / bucket.runs) : 0;
+  const failure = bucket.failed > 0 ? `, ${bucket.failed} failed` : "";
+  return `  ${label}: ${formatMetricCost(bucket)} · ${bucket.runs} runs${failure} · ${bucket.inputTokens} in/${bucket.outputTokens} out · ${bucket.toolCount} tools · avg ${formatElapsed(average)}`;
+}
+
+function formatSubagentMetrics(ctx: ExtensionContext): string {
+  const parentSessionFile = ctx.sessionManager.getSessionFile();
+  if (!parentSessionFile) return "Subagent metrics require a persistent parent session.";
+  const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+  const metrics = summarizeSubagentMetrics(collectMetricRecords(artifactDir, parentSessionFile));
+  if (metrics.runs === 0) return "No completed subagent metrics in this session.";
+
+  const lines = [
+    "Subagent metrics",
+    "",
+    `Total: ${formatMetricCost(metrics)} · ${metrics.runs} runs · ${metrics.failed} failed`,
+    `Tokens: ${metrics.inputTokens} input / ${metrics.outputTokens} output · ${metrics.toolCount} tools`,
+    `Elapsed: ${formatElapsed(metrics.elapsedSeconds)}`,
+    "",
+    "By agent:",
+    ...[...metrics.byAgent.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, bucket]) => formatMetricBucket(name, bucket)),
+    "",
+    "By model:",
+    ...[...metrics.byModel.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, bucket]) => formatMetricBucket(name, bucket)),
+  ];
+  return lines.join("\n");
+}
+
 async function spawnFromCommand(
   pi: ExtensionAPI,
   args: string,
@@ -2139,6 +2283,7 @@ async function openSubagentMenu(
   const choice = await ctx.ui.select("Subagents", [
     "Spawn subagent",
     "List available subagents",
+    "View metrics",
     "Use current tab",
     "Use separate tab (hidden)",
     "Show subagent view",
@@ -2157,6 +2302,9 @@ async function openSubagentMenu(
     }
     case "List available subagents":
       listSubagents((message) => ctx.ui.notify(message, "info"));
+      return;
+    case "View metrics":
+      ctx.ui.notify(formatSubagentMetrics(ctx), "info");
       return;
     case "Use current tab":
       setSubagentLayout(false, (message) => ctx.ui.notify(message, "info"));
@@ -2960,6 +3108,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       switch (operation.toLowerCase()) {
         case "list":
           listSubagents((message) => ctx.ui.notify(message, "info"));
+          return;
+        case "metrics":
+          ctx.ui.notify(formatSubagentMetrics(ctx), "info");
           return;
         case "mode":
           if (remainder === "current" || remainder === "default") {

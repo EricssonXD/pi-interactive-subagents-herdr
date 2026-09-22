@@ -764,6 +764,8 @@ export interface SessionStats {
   contextTokens: number;
   /** Cumulative cost in USD across all assistant turns. */
   cost: number;
+  /** Whether at least one provider usage record included pricing. */
+  costKnown: boolean;
 }
 
 /**
@@ -790,6 +792,7 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
     cacheWriteTokens: 0,
     contextTokens: 0,
     cost: 0,
+    costKnown: false,
   };
 
   for (const entry of entries) {
@@ -819,7 +822,13 @@ export function summarizeSessionStats(sessionFile: string): SessionStats | null 
       const total = num(usage.totalTokens);
       if (total > 0) stats.contextTokens = total;
       const cost = usage.cost;
-      if (cost && typeof cost === "object") stats.cost += num((cost as Record<string, unknown>).total);
+      if (cost && typeof cost === "object") {
+        const total = (cost as Record<string, unknown>).total;
+        if (typeof total === "number" && Number.isFinite(total)) {
+          stats.cost += total;
+          stats.costKnown = true;
+        }
+      }
     }
   }
 
