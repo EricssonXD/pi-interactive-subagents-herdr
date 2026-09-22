@@ -101,8 +101,10 @@ export interface SubagentLoadout {
   toolAllowlist: string | null;
   /** Explicit extension paths needed inside a restricted child (for example a model provider). */
   extensions?: string[];
-  /** Model id (without thinking suffix), or null to use the session default. */
+  /** Model id (without thinking suffix), or null for legacy sessions. */
   model: string | null;
+  /** Where the effective model came from. */
+  modelSource?: "profile" | "override";
   /** Thinking level appended to the model as `model:level`, or null. */
   thinking: string | null;
   /** How the identity text was applied: append/replace, or null. */
@@ -182,6 +184,8 @@ export interface ChildLifecycleRecord {
   activityFile?: string;
   cli?: string;
   sentinelFile?: string;
+  model?: string;
+  modelSource?: "profile" | "override";
   interactive: boolean;
   status: ChildLifecycleStatus;
   updatedAt: number;

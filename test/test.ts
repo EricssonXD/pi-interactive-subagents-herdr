@@ -1241,6 +1241,36 @@ describe("subagent discovery", () => {
     });
   });
 
+  it("loads model override permission from frontmatter", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "model-override-test-agent",
+        [
+          "name: model-override-test-agent",
+          "model: azure-foundry/test",
+          "allow-model-override: true",
+        ].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("model-override-test-agent");
+      assert.equal(loaded?.allowModelOverride, true);
+    });
+  });
+
+  it("defaults model override permission to false", async () => {
+    await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+      writeAgentFile(
+        projectAgentsDir,
+        "model-override-default-agent",
+        ["name: model-override-default-agent", "model: azure-foundry/test"].join("\n"),
+      );
+
+      const loaded = testApi.loadAgentDefaults("model-override-default-agent");
+      assert.notEqual(loaded?.allowModelOverride, true);
+    });
+  });
+
   it("loads explicit extensions from frontmatter", async () => {
     await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
       writeAgentFile(
@@ -1407,6 +1437,41 @@ describe("subagent discovery", () => {
       assert.ok(loaded, "expected agent to load");
       assert.equal(loaded.sessionMode, undefined);
     });
+  });
+
+  it("rejects an override unless the agent profile allows it", () => {
+    assert.throws(
+      () => testApi.resolveEffectiveModel(
+        { agent: "scout", task: "T", model: "openai-codex/gpt-5.4" },
+        { model: "azure-foundry/gpt-5.6-luna" },
+      ),
+      /does not allow model overrides.*azure-foundry\/gpt-5.6-luna/,
+    );
+    assert.deepEqual(
+      testApi.resolveEffectiveModel(
+        { agent: "scout", task: "T", model: "openai-codex/gpt-5.4" },
+        { model: "azure-foundry/gpt-5.6-luna", allowModelOverride: true },
+      ),
+      { model: "openai-codex/gpt-5.4", source: "override" },
+    );
+    assert.deepEqual(
+      testApi.resolveEffectiveModel({ agent: "custom", task: "T", model: "openai-codex/gpt-5.4" }, null),
+      { model: "openai-codex/gpt-5.4", source: "override" },
+    );
+    assert.deepEqual(
+      testApi.resolveEffectiveModel(
+        { agent: "scout", task: "T" },
+        { model: "azure-foundry/gpt-5.6-luna" },
+      ),
+      { model: "azure-foundry/gpt-5.6-luna", source: "profile" },
+    );
+  });
+
+  it("rejects a named agent without a configured or allowed model", () => {
+    assert.throws(
+      () => testApi.resolveEffectiveModel({ agent: "scout", task: "T" }, {}),
+      /has no model configured/,
+    );
   });
 
   it("resolves session mode from frontmatter (standalone default)", () => {
@@ -1999,14 +2064,37 @@ describe("tmux.ts completion detection", () => {
     }
   });
 
-  it("reports a disappeared pane instead of polling forever", async () => {
-    const result = await pollForExit("missing-pane", new AbortController().signal, {
-      interval: 1,
-      readScreenAsyncFn: async () => { throw new Error("pane not found"); },
-    });
-    assert.equal(result.reason, "error");
-    assert.equal(result.exitCode, 1);
-    assert.match(result.errorMessage ?? "", /missing-pane.*unreadable/);
+  it("keeps polling through pane errors until a durable completion appears", async () => {
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    let ticks = 0;
+    try {
+      const result = await pollForExit("missing-pane", new AbortController().signal, {
+        interval: 1,
+        sessionFile,
+        readScreenAsyncFn: async () => { throw new Error("pane not found"); },
+        onTick: () => {
+          ticks++;
+          if (ticks === 2) writeFileSync(`${sessionFile}.complete`, "0\n");
+        },
+      });
+      assert.deepEqual(result, { reason: "sentinel", exitCode: 0 });
+      assert.ok(ticks >= 2, "pane errors should not terminate supervision");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("can be aborted without converting an unreadable pane into a failure", async () => {
+    const controller = new AbortController();
+    await assert.rejects(
+      pollForExit("missing-pane", controller.signal, {
+        interval: 1,
+        readScreenAsyncFn: async () => { throw new Error("pane not found"); },
+        onTick: () => controller.abort(),
+      }),
+      /Aborted/,
+    );
   });
 });
 

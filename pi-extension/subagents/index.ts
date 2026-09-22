@@ -116,7 +116,9 @@ const SubagentParams = Type.Object({
         "Has no effect on which agent runs — use `agent` for that.",
     }),
   ),
-  model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
+  model: Type.Optional(
+    Type.String({ description: "Optional model; replaces a profile model only when explicitly allowed" }),
+  ),
   cwd: Type.Optional(
     Type.String({
       description:
@@ -129,6 +131,8 @@ type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
   model?: string;
+  /** Allow a caller to replace the profile model for this agent. */
+  allowModelOverride?: boolean;
   tools?: string;
   extensions?: string[];
   skills?: string;
@@ -307,6 +311,9 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
+    allowModelOverride: parseOptionalBoolean(
+      getFrontmatterValue(frontmatter, "allow-model-override"),
+    ),
     tools: getFrontmatterValue(frontmatter, "tools"),
     extensions: parseCommaList(getFrontmatterValue(frontmatter, "extensions")),
     systemPromptMode:
@@ -424,6 +431,42 @@ function resolveEffectiveInteractive(
 ): boolean {
   if (agentDefs?.interactive != null) return agentDefs.interactive;
   return !(agentDefs?.autoExit ?? false);
+}
+
+interface EffectiveModel {
+  model: string;
+  source: "profile" | "override";
+}
+
+function resolveEffectiveModel(
+  params: Static<typeof SubagentParams>,
+  agentDefs: AgentDefaults | null,
+): EffectiveModel {
+  const configuredModel = agentDefs?.model?.trim();
+  const requestedModel = params.model?.trim();
+
+  if (requestedModel && configuredModel && agentDefs?.allowModelOverride !== true) {
+    throw new Error(
+      `Agent "${params.agent}" does not allow model overrides. ` +
+      `Configured model: ${configuredModel}. Add allow-model-override: true to its profile.`,
+    );
+  }
+
+  const model = requestedModel && (!configuredModel || agentDefs?.allowModelOverride === true)
+    ? requestedModel
+    : configuredModel;
+  if (!model) {
+    throw new Error(
+      `Agent "${params.agent}" has no model configured. Set model in its profile or provide an override.`,
+    );
+  }
+
+  return {
+    model,
+    source: requestedModel && (!configuredModel || agentDefs?.allowModelOverride === true)
+      ? "override"
+      : "profile",
+  };
 }
 
 function loadAgentDefaults(agentName: string): AgentDefaults | null {
@@ -607,6 +650,8 @@ function lifecycleRecordFor(
     ...(running.activityFile ? { activityFile: running.activityFile } : {}),
     ...(running.cli ? { cli: running.cli } : {}),
     ...(running.sentinelFile ? { sentinelFile: running.sentinelFile } : {}),
+    ...(running.model ? { model: running.model } : {}),
+    ...(running.modelSource ? { modelSource: running.modelSource } : {}),
     interactive: running.interactive,
     status: "running",
     updatedAt: Date.now(),
@@ -648,6 +693,8 @@ function runningFromLifecycle(record: ChildLifecycleRecord): RunningSubagent {
     parentSessionFile: record.parentSessionFile,
     cli: record.cli,
     sentinelFile: record.sentinelFile,
+    model: record.model,
+    modelSource: record.modelSource,
     interactive: record.interactive,
     statusState: createStatusState({ source: record.cli === "claude" ? "claude" : "pi", startTimeMs: record.startTime }),
   };
@@ -752,6 +799,8 @@ interface SubagentResult {
   stats?: SessionStats;
   /** Stable id used by durable lifecycle reconciliation. */
   childId?: string;
+  model?: string;
+  modelSource?: "profile" | "override";
 }
 
 /**
@@ -790,6 +839,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** Stable id is persisted before the child is watched and survives reloads. */
   childId?: string;
+  model?: string;
+  modelSource?: "profile" | "override";
 }
 
 /** All currently running subagents, keyed by id. */
@@ -1304,6 +1355,7 @@ export const __test__ = {
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
+  resolveEffectiveModel,
   buildSubagentToolAllowlist,
   applySandboxToParts,
   buildPiPromptArgs,
@@ -1353,7 +1405,8 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const modelSelection = resolveEffectiveModel(params, agentDefs);
+  const effectiveModel = modelSelection.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1484,6 +1537,8 @@ async function launchSubagent(
       cli: "claude",
       sentinelFile,
       childId: id,
+      model: effectiveModel,
+      modelSource: modelSelection.source,
       lifecycleArtifactDir: artifactDir,
       parentSessionFile: sessionFile,
       interactive: effectiveInteractive,
@@ -1543,7 +1598,8 @@ async function launchSubagent(
     agent: params.agent ?? null,
     toolAllowlist,
     extensions: agentDefs?.extensions ?? [],
-    model: effectiveModel ?? null,
+    model: effectiveModel,
+    modelSource: modelSelection.source,
     thinking: effectiveThinking ?? null,
     systemPromptMode: systemPromptMode ?? null,
     identity: identityInSystemPrompt ? identity : null,
@@ -1650,6 +1706,8 @@ async function launchSubagent(
     launchScriptFile,
     activityFile,
     childId: id,
+    model: effectiveModel,
+    modelSource: modelSelection.source,
     lifecycleArtifactDir: artifactDir,
     parentSessionFile: sessionFile,
     interactive: effectiveInteractive,
@@ -1777,7 +1835,16 @@ async function watchSubagent(
       closeSurface(surface);
       runningSubagents.delete(running.id);
 
-      const childResult = { name, task, summary, exitCode: result.exitCode, elapsed, childId: running.childId };
+      const childResult: SubagentResult = {
+        name,
+        task,
+        summary,
+        exitCode: result.exitCode,
+        elapsed,
+        childId: running.childId,
+        model: running.model,
+        modelSource: running.modelSource,
+      };
       markRunningCompleted(running, childResult);
       return childResult;
     }
@@ -1818,30 +1885,38 @@ async function watchSubagent(
       ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
       ...(stats ? { stats } : {}),
       childId: running.childId,
+      model: running.model,
+      modelSource: running.modelSource,
     };
     markRunningCompleted(running, childResult);
     return childResult;
   } catch (err: any) {
-    try {
-      closeSurface(surface);
-    } catch {}
+    const supervisionAborted = signal.aborted || getModuleAbortSignal().aborted;
     runningSubagents.delete(running.id);
 
-    if (signal.aborted) {
-      const childResult: SubagentResult = {
+    if (supervisionAborted) {
+      // Parent shutdown/reload stops supervision, never the child surface.
+      // Leave the durable record as running for session_start reconciliation.
+      return {
         name,
         task,
-        summary: "Subagent cancelled.",
+        summary: "Subagent supervision paused.",
         exitCode: 1,
         elapsed: Math.floor((Date.now() - startTime) / 1000),
         error: "cancelled",
         sessionFile,
         childId: running.childId,
+        model: running.model,
+        modelSource: running.modelSource,
       };
-      // Abort is the parent shutting down/reloading, not child completion.
-      // Leave the durable record as running for session_start reconciliation.
-      return childResult;
     }
+
+    // Only close a surface after a durable terminal signal or a genuine
+    // watcher error unrelated to supervision shutdown.
+    try {
+      closeSurface(surface);
+    } catch {}
+
     const childResult: SubagentResult = {
       name,
       task,
@@ -1850,6 +1925,8 @@ async function watchSubagent(
       elapsed: Math.floor((Date.now() - startTime) / 1000),
       error: err?.message ?? String(err),
       childId: running.childId,
+      model: running.model,
+      modelSource: running.modelSource,
     };
     markRunningCompleted(running, childResult);
     return childResult;
@@ -2635,6 +2712,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
         }
 
+        if (!loadout.model) {
+          const err =
+            `Cannot safely resume "${requestedName}": its saved session has no explicit model. ` +
+            `Refusing to inherit the parent model; spawn a fresh agent instead.`;
+          return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
         const resumedSessionId = entry.sessionId ?? getSessionId(sessionPath) ?? requestedName;
 
         // Record entry count before resuming so we can extract new messages.
@@ -2737,6 +2821,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           childId: id,
+          model: loadout.model ?? undefined,
+          modelSource: loadout.modelSource,
           lifecycleArtifactDir: parentArtifactDir,
           parentSessionFile,
           interactive,

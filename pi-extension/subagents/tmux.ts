@@ -305,7 +305,6 @@ export async function pollForExit(
   },
 ): Promise<PollResult> {
   const start = Date.now();
-  let consecutiveReadErrors = 0;
 
   for (;;) {
     if (signal.aborted) {
@@ -349,28 +348,10 @@ export async function pollForExit(
       if (match) {
         return { reason: "sentinel", exitCode: parseInt(match[1], 10) };
       }
-    } catch (error: any) {
-      // Sidecars can land between the fast-path check and a failed pane read.
-      if (options.sessionFile) {
-        try {
-          const completion = readCompletionSidecar(options.sessionFile);
-          if (completion) return completion;
-          const exitFile = `${options.sessionFile}.exit`;
-          if (existsSync(exitFile)) {
-            const data = JSON.parse(readFileSync(exitFile, "utf-8"));
-            rmSync(exitFile, { force: true });
-            return interpretExitSidecar(data);
-          }
-        } catch {}
-      }
-      consecutiveReadErrors++;
-      if (consecutiveReadErrors >= 5) {
-        return {
-          reason: "error",
-          exitCode: 1,
-          errorMessage: `Subagent surface ${surface} became unreadable before completion: ${error?.message ?? String(error)}`,
-        };
-      }
+    } catch {
+      // A missing/unreadable pane is not proof that the child exited. The
+      // durable sidecars above remain authoritative; keep retrying so a live
+      // child or a child waiting on nested work is never killed accidentally.
     }
 
     const elapsed = Math.floor((Date.now() - start) / 1000);
