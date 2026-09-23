@@ -1,5 +1,19 @@
 {
   "status": {
     "enabled": true
+  },
+  "intelligenceLevels": {
+    "low": {
+      "model": "openrouter/z-ai/glm-5.3",
+      "thinking": "low"
+    },
+    "mid": {
+      "model": "openrouter/z-ai/glm-5.3",
+      "thinking": "medium"
+    },
+    "high": {
+      "model": "openrouter/z-ai/glm-5.3",
+      "thinking": "high"
+    }
   }
 }

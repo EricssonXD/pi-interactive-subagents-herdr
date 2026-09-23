@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
+import { initTheme, ModelSelectorComponent } from "@mariozechner/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -2313,7 +2314,7 @@ describe("commands", () => {
     }
   });
 
-  it("opens a unified menu when /subagent has no arguments", async () => {
+  it("opens the grouped menu when /subagent has no arguments", async () => {
     const { api, registeredCommands } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const subagent = registeredCommands.find((command) => command.name === "subagent");
@@ -2337,11 +2338,109 @@ describe("commands", () => {
       "Spawn subagent",
       "List available subagents",
       "View metrics",
-      "Use current tab",
-      "Use separate tab (hidden)",
-      "Show subagent view",
-      "Hide subagent view",
+      "Display",
+      "Config",
     ]);
+  });
+
+  it("groups pane and view controls under Display", async () => {
+    const previousMode = process.env.PI_SUBAGENT_LAYOUT_MODE;
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
+
+    const titles: string[] = [];
+    const optionLists: string[][] = [];
+    const selections = ["Display", "Use separate tab (hidden)"];
+    const notifications: string[] = [];
+    try {
+      delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+      await subagent.handler("", {
+        ui: {
+          async select(title: string, options: string[]) {
+            titles.push(title);
+            optionLists.push(options);
+            return selections.shift();
+          },
+          notify(message: string) { notifications.push(message); },
+        },
+      });
+      assert.deepEqual(titles, ["Subagents", "Subagents · Display"]);
+      assert.deepEqual(optionLists[1], [
+        "Use current tab",
+        "Use separate tab (hidden)",
+        "Show subagent view",
+        "Hide subagent view",
+      ]);
+      assert.equal(process.env.PI_SUBAGENT_LAYOUT_MODE, "separate");
+      assert.deepEqual(notifications, ["Subagent layout: separate tab (hidden)"]);
+    } finally {
+      if (previousMode === undefined) delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+      else process.env.PI_SUBAGENT_LAYOUT_MODE = previousMode;
+    }
+  });
+
+  it("cancels nested menus cleanly when the user presses Escape", async () => {
+    const previousMode = process.env.PI_SUBAGENT_LAYOUT_MODE;
+    try {
+      delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+      for (const branch of ["Display", "Config"]) {
+        const { api, registeredCommands } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const subagent = registeredCommands.find((command) => command.name === "subagent");
+        assert.ok(subagent, "expected /subagent to be registered");
+
+        const titles: string[] = [];
+        const selections = [branch, undefined];
+        await subagent.handler("", {
+          hasUI: true,
+          ui: {
+            async select(title: string) {
+              titles.push(title);
+              return selections.shift();
+            },
+            input: async () => { throw new Error("Escape should not open another prompt"); },
+            notify() {},
+          },
+        });
+        assert.deepEqual(titles, ["Subagents", `Subagents · ${branch}`]);
+      }
+      assert.equal(process.env.PI_SUBAGENT_LAYOUT_MODE, undefined);
+    } finally {
+      if (previousMode === undefined) delete process.env.PI_SUBAGENT_LAYOUT_MODE;
+      else process.env.PI_SUBAGENT_LAYOUT_MODE = previousMode;
+    }
+  });
+
+  it("routes Config → Intelligence to the intelligence-level manager", async () => {
+    const { api, registeredCommands } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagent = registeredCommands.find((command) => command.name === "subagent");
+    assert.ok(subagent, "expected /subagent to be registered");
+
+    const titles: string[] = [];
+    const optionLists: string[][] = [];
+    const selections = ["Config", "Intelligence", "Done"];
+    await subagent.handler("", {
+      hasUI: true,
+      ui: {
+        async select(title: string, options: string[]) {
+          titles.push(title);
+          optionLists.push(options);
+          return selections.shift();
+        },
+        input: async () => undefined,
+        notify() {},
+      },
+    });
+
+    assert.deepEqual(titles, [
+      "Subagents",
+      "Subagents · Config",
+      "Subagent settings · intelligence levels",
+    ]);
+    assert.deepEqual(optionLists[1], ["Intelligence"]);
   });
 
   it("does not register the removed /iterate or /plan commands", () => {
@@ -2349,6 +2448,348 @@ describe("commands", () => {
     (subagentsModule as any).default(api);
     assert.equal(registeredCommands.find((c) => c.name === "iterate"), undefined);
     assert.equal(registeredCommands.find((c) => c.name === "plan"), undefined);
+  });
+});
+
+describe("intelligence-level settings", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  it("resolves arbitrary profile levels while retaining direct and spawn overrides", () => {
+    const agent = testApi.parseAgentDefinition(
+      [
+        "---",
+        "name: careful-agent",
+        "intelligence-level: careful custom",
+        "---",
+        "Prompt",
+      ].join("\n"),
+      "fallback",
+    );
+    assert.equal(agent?.intelligenceLevel, "careful custom");
+
+    const levels = testApi.parseIntelligenceLevels({
+      intelligenceLevels: {
+        "careful custom": { model: "provider/catalog", thinking: "high" },
+      },
+    }, "test config");
+    const resolved = testApi.resolveIntelligenceSettings(agent, levels, "careful-agent");
+    assert.deepEqual(resolved, { model: "provider/catalog", thinking: "high" });
+    assert.deepEqual(
+      testApi.resolveEffectiveModel({ agent: "careful-agent" }, { ...agent, ...resolved }),
+      { model: "provider/catalog", source: "profile" },
+    );
+
+    const profileOverrides = testApi.resolveIntelligenceSettings({
+      ...agent,
+      model: "provider/profile",
+      thinking: "low",
+    }, levels, "careful-agent");
+    assert.deepEqual(profileOverrides, { model: "provider/profile", thinking: "low" });
+
+    const spawn = testApi.resolveEffectiveModel(
+      { agent: "careful-agent", model: "provider/spawn" },
+      { ...agent, ...resolved, allowModelOverride: true },
+    );
+    assert.deepEqual(spawn, { model: "provider/spawn", source: "override" });
+  });
+
+  it("merges custom levels and rejects invalid or unknown entries", () => {
+    const dir = createTestDir();
+    try {
+      const configPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(examplePath, JSON.stringify({
+        intelligenceLevels: { low: { model: "provider/default", thinking: "low" } },
+      }));
+      writeFileSync(configPath, JSON.stringify({
+        intelligenceLevels: { "careful custom": { model: "provider/custom", thinking: "high" } },
+      }));
+
+      const levels = testApi.loadIntelligenceLevels(configPath, examplePath);
+      assert.equal(levels.low.model, "provider/default");
+      assert.equal(levels["careful custom"].model, "provider/custom");
+      assert.throws(
+        () => testApi.resolveIntelligenceSettings({ intelligenceLevel: "missing" }, levels, "agent"),
+        /Unknown intelligence level "missing".*config.json/,
+      );
+      assert.throws(
+        () => testApi.resolveIntelligenceSettings({ intelligenceLevel: "constructor" }, levels, "agent"),
+        /Unknown intelligence level "constructor".*config.json/,
+      );
+      assert.throws(
+        () => testApi.parseIntelligenceLevels(
+          { intelligenceLevels: { broken: { model: " " } } },
+          "invalid-levels.json",
+        ),
+        /invalid-levels\.json.*model must be a nonblank string/,
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("warns when a configured model is unavailable and leaves it unselected", async () => {
+    initTheme(undefined, false);
+    const availableModel = { provider: "provider", id: "available", name: "Available" };
+    const warnings: string[] = [];
+    const modelRegistry = {
+      refresh() {},
+      getError() { return undefined; },
+      getAvailable: () => [availableModel],
+      find() { return undefined; },
+    };
+    const ui = {
+      notify(message: string) { warnings.push(message); },
+      async custom(factory: any) {
+        let result: unknown;
+        const component = factory(
+          { requestRender() {} },
+          { fg(_color: string, text: string) { return text; } },
+          {},
+          (value: unknown) => { result = value; },
+        );
+        assert.ok(component instanceof ModelSelectorComponent);
+        assert.equal((component as any).currentModel, undefined);
+        await new Promise((resolve) => setImmediate(resolve));
+        component.handleInput("\u001b");
+        return result;
+      },
+    };
+
+    assert.equal(
+      await testApi.selectIntelligenceModel(ui, modelRegistry, "retired/model"),
+      undefined,
+    );
+    assert.ok(warnings.some((message) => message.includes('"retired/model" is unavailable')));
+  });
+
+  it("adapts the native selector's ModelRuntime-based API", async () => {
+    const model = { provider: "provider", id: "model", name: "Model" };
+    const refreshResult = { aborted: false, errors: new Map() };
+    let refreshOptions: unknown;
+    const modelRegistry = {
+      getAvailable: () => [model],
+      find: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+      getError: () => "registry warning",
+      refresh: async (options: unknown) => {
+        refreshOptions = options;
+        return refreshResult;
+      },
+    };
+    class RuntimeSelector {
+      args: unknown[];
+      constructor(
+        tui: unknown,
+        currentModel: unknown,
+        runtime: unknown,
+        scopedModels: unknown[],
+        onSelect: Function,
+        onCancel: Function,
+        initialSearchInput?: unknown,
+        onSelectAsDefault?: Function,
+        defaultModel?: unknown,
+      ) {
+        (runtime as any).getAvailableSnapshot();
+        this.args = [tui, currentModel, runtime, scopedModels, onSelect, onCancel, initialSearchInput, onSelectAsDefault, defaultModel];
+      }
+    }
+
+    const onSelect = () => {};
+    const onCancel = () => {};
+    const selector = testApi.createIntelligenceModelSelector(
+      {}, model, modelRegistry, onSelect, onCancel, RuntimeSelector as any,
+    ) as InstanceType<typeof RuntimeSelector>;
+    const [, , runtime, scopedModels, select, cancel] = selector.args as any[];
+    assert.deepEqual(scopedModels, []);
+    assert.equal(select, onSelect);
+    assert.equal(cancel, onCancel);
+    assert.deepEqual(runtime.getAvailableSnapshot(), [model]);
+    assert.equal(runtime.getModel("provider", "model"), model);
+    assert.equal(runtime.getError(), "registry warning");
+
+    const options = { marker: true };
+    assert.equal(await runtime.refresh(options), refreshResult);
+    assert.equal(refreshOptions, options);
+  });
+
+  it("adds and edits custom levels with the native searchable model selector and thinking choices", async () => {
+    initTheme(undefined, false);
+    const dir = createTestDir();
+    try {
+      const configPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(examplePath, JSON.stringify({
+        status: { enabled: true },
+        intelligenceLevels: { low: { model: "provider/cheap", thinking: "low" } },
+      }));
+      const actions = [
+        "Add intelligence level",
+        "Edit intelligence level", "Model",
+        "Edit intelligence level", "Thinking",
+        "Done",
+      ];
+      const searches = ["careful", "updated"];
+      const thinkingLevels = ["high", "low"];
+      const inputs = ["careful custom"];
+      const notices: string[] = [];
+      const availableModels = [
+        { provider: "provider", id: "careful", name: "Careful model" },
+        { provider: "provider", id: "updated", name: "Updated model" },
+      ];
+      const modelRegistry = {
+        refresh() {},
+        getError() { return undefined; },
+        getAvailable: () => availableModels,
+        find(provider: string, id: string) {
+          return availableModels.find((model) => model.provider === provider && model.id === id);
+        },
+      };
+      const ui = {
+        async select(title: string, options: string[]) {
+          if (title === "Choose an intelligence level") {
+            return options.find((option) => option.includes("careful custom"));
+          }
+          if (title === "Thinking effort") {
+            const level = thinkingLevels.shift();
+            return options.find((option) => option.trimStart().replace(/^✓ /, "").startsWith(`${level} —`));
+          }
+          return actions.shift();
+        },
+        async input() { return inputs.shift(); },
+        async custom(factory: any) {
+          let result: unknown;
+          const component = factory(
+            { requestRender() {} },
+            { fg(_color: string, text: string) { return text; }, bold(text: string) { return text; } },
+            { matches(data: string, action: string) { return data === "\r" && action === "tui.select.confirm"; } },
+            (value: unknown) => { result = value; },
+          );
+          assert.ok(component instanceof ModelSelectorComponent);
+          await new Promise((resolve) => setImmediate(resolve));
+          const search = searches.shift() ?? "";
+          if (search === "updated") {
+            assert.ok(
+              component.render(80).some((line: string) => line.includes("careful") && line.includes("✓")),
+              "editing should preselect the preset's current model",
+            );
+          }
+          for (const character of search) component.handleInput(character);
+          assert.equal(component.getSearchInput().getValue(), search);
+          component.handleInput("\r");
+          assert.notEqual(result, undefined, "the native model selector should return the selected model");
+          return result;
+        },
+        notify(message: string) { notices.push(message); },
+      };
+
+      await testApi.manageIntelligenceLevels({ ui, modelRegistry }, configPath, examplePath);
+      assert.ok(existsSync(configPath), `intelligence config was not written: ${notices.join(" | ")}`);
+
+      const stored = JSON.parse(readFileSync(configPath, "utf8"));
+      assert.equal(stored.status.enabled, true);
+      const levels = testApi.loadIntelligenceLevels(configPath, examplePath);
+      assert.deepEqual(levels["careful custom"], {
+        model: "provider/updated",
+        thinking: "low",
+      });
+      assert.deepEqual(
+        testApi.resolveIntelligenceSettings({ intelligenceLevel: "careful custom" }, levels, "agent"),
+        { model: "provider/updated", thinking: "low" },
+      );
+      assert.ok(notices.some((message) => message.includes("intelligence-level: careful custom")));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not write config when adding a level is cancelled or no models are available", async () => {
+    initTheme(undefined, false);
+    const dir = createTestDir();
+    try {
+      const configPath = join(dir, "config.json");
+      const examplePath = join(dir, "config.json.example");
+      writeFileSync(examplePath, JSON.stringify({ intelligenceLevels: {} }));
+      const actions = ["Add intelligence level", "Done"];
+      const cancelUi = {
+        async select() { return actions.shift(); },
+        async input() { return undefined; },
+        notify() {},
+      };
+      await testApi.manageIntelligenceLevels({ ui: cancelUi, modelRegistry: { getAvailable: () => [] } }, configPath, examplePath);
+      assert.equal(existsSync(configPath), false);
+
+      const noModelsActions = ["Add intelligence level", "Done"];
+      const inputs = ["careful"];
+      const notices: string[] = [];
+      const noModelsUi = {
+        async select() { return noModelsActions.shift(); },
+        async input() { return inputs.shift(); },
+        notify(message: string) { notices.push(message); },
+      };
+      await testApi.manageIntelligenceLevels({ ui: noModelsUi, modelRegistry: { getAvailable: () => [] } }, configPath, examplePath);
+      assert.equal(existsSync(configPath), false);
+      assert.ok(notices.some((message) => /No available models/.test(message)));
+
+      const availableModels = [{ provider: "provider", id: "model", name: "Model" }];
+      const modelRegistry = {
+        refresh() {},
+        getError() { return undefined; },
+        getAvailable: () => availableModels,
+        find(provider: string, id: string) {
+          return availableModels.find((model) => model.provider === provider && model.id === id);
+        },
+      };
+      const cancelModelActions = ["Add intelligence level", "Done"];
+      const cancelModelErrors: string[] = [];
+      const cancelModelUi = {
+        async select() { return cancelModelActions.shift(); },
+        async input() { return "careful"; },
+        async custom(factory: any) {
+          let result: unknown;
+          let cancelled = false;
+          const component = factory(
+            { requestRender() {} },
+            { fg(_color: string, text: string) { return text; } },
+            {},
+            (value: unknown) => { result = value; cancelled = true; },
+          );
+          await new Promise((resolve) => setImmediate(resolve));
+          component.handleInput("\u001b");
+          assert.equal(cancelled, true, "Escape should cancel the native model selector");
+          assert.equal(result, undefined);
+          return result;
+        },
+        notify(message: string) { cancelModelErrors.push(message); },
+      };
+      await testApi.manageIntelligenceLevels({ ui: cancelModelUi, modelRegistry }, configPath, examplePath);
+      assert.equal(existsSync(configPath), false);
+      assert.deepEqual(cancelModelErrors, []);
+
+      const cancelThinkingActions = ["Add intelligence level", "Done"];
+      const cancelThinkingUi = {
+        async select(title: string) {
+          return title === "Thinking effort" ? undefined : cancelThinkingActions.shift();
+        },
+        async input() { return "careful"; },
+        async custom(factory: any) {
+          let result: unknown;
+          const component = factory(
+            { requestRender() {} },
+            { fg(_color: string, text: string) { return text; } },
+            {},
+            (value: unknown) => { result = value; },
+          );
+          await new Promise((resolve) => setImmediate(resolve));
+          component.handleInput("\r");
+          return result;
+        },
+        notify() {},
+      };
+      await testApi.manageIntelligenceLevels({ ui: cancelThinkingUi, modelRegistry }, configPath, examplePath);
+      assert.equal(existsSync(configPath), false);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 

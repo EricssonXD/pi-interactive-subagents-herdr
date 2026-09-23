@@ -1,7 +1,12 @@
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { keyHint } from "@mariozechner/pi-coding-agent";
+import { keyHint, ModelSelectorComponent, SettingsManager } from "@mariozechner/pi-coding-agent";
 import { Type, type Static } from "@sinclair/typebox";
-import { Box, Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import {
+  Box,
+  Text,
+  truncateToWidth,
+  visibleWidth,
+} from "@mariozechner/pi-tui";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -10,6 +15,7 @@ import {
   writeFileSync,
   existsSync,
   mkdirSync,
+  renameSync,
   unlinkSync,
 } from "node:fs";
 import { homedir } from "node:os";
@@ -77,6 +83,9 @@ import {
 
 /** Absolute path to `pi-extension/subagents`. https://github.com/nodejs/node/issues/37845 */
 const SUBAGENTS_DIR = dirname(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = join(SUBAGENTS_DIR, "../..");
+const INTELLIGENCE_CONFIG_PATH = join(PACKAGE_ROOT, "config.json");
+const INTELLIGENCE_CONFIG_EXAMPLE_PATH = join(PACKAGE_ROOT, "config.json.example");
 
 // Survive /reload: clear timers and abort poll loops from the previous module load.
 // /reload re-imports this file, giving fresh module-level state, but closures from
@@ -134,6 +143,7 @@ type SubagentSessionMode = "standalone" | "lineage-only" | "fork";
 
 interface AgentDefaults {
   model?: string;
+  intelligenceLevel?: string;
   /** Allow a caller to replace the profile model for this agent. */
   allowModelOverride?: boolean;
   tools?: string;
@@ -302,6 +312,312 @@ function parseSessionMode(value: string | undefined): SubagentSessionMode | unde
   return undefined;
 }
 
+interface IntelligenceLevel {
+  model: string;
+  thinking?: string;
+}
+
+function invalidIntelligenceConfig(source: string, message: string): never {
+  throw new Error(`Invalid subagent intelligence config in ${source}: ${message}`);
+}
+
+function parseIntelligenceLevels(
+  rawConfig: unknown,
+  source: string,
+): Record<string, IntelligenceLevel> {
+  if (rawConfig == null || typeof rawConfig !== "object" || Array.isArray(rawConfig)) {
+    return invalidIntelligenceConfig(source, "root must be an object");
+  }
+
+  const rawLevels = (rawConfig as Record<string, unknown>).intelligenceLevels;
+  if (rawLevels === undefined) return {};
+  if (rawLevels == null || typeof rawLevels !== "object" || Array.isArray(rawLevels)) {
+    return invalidIntelligenceConfig(source, "intelligenceLevels must be an object");
+  }
+
+  const levels = Object.create(null) as Record<string, IntelligenceLevel>;
+  for (const [name, rawLevel] of Object.entries(rawLevels)) {
+    if (!name.trim() || name !== name.trim() || /[\u0000-\u001f\u007f]/.test(name)) {
+      return invalidIntelligenceConfig(source, "intelligence level names must be nonblank and trimmed");
+    }
+    if (rawLevel == null || typeof rawLevel !== "object" || Array.isArray(rawLevel)) {
+      return invalidIntelligenceConfig(source, `intelligenceLevels.${name} must be an object`);
+    }
+
+    const level = rawLevel as Record<string, unknown>;
+    const unsupported = Object.keys(level).filter((key) => key !== "model" && key !== "thinking");
+    if (unsupported.length > 0) {
+      return invalidIntelligenceConfig(
+        source,
+        `intelligenceLevels.${name} has unsupported key(s): ${unsupported.join(", ")}`,
+      );
+    }
+    if (typeof level.model !== "string" || !level.model.trim()) {
+      return invalidIntelligenceConfig(source, `intelligenceLevels.${name}.model must be a nonblank string`);
+    }
+    if (
+      level.thinking !== undefined &&
+      (typeof level.thinking !== "string" || !level.thinking.trim())
+    ) {
+      return invalidIntelligenceConfig(source, `intelligenceLevels.${name}.thinking must be a nonblank string`);
+    }
+
+    levels[name] = {
+      model: level.model.trim(),
+      ...(typeof level.thinking === "string" ? { thinking: level.thinking.trim() } : {}),
+    };
+  }
+  return levels;
+}
+
+function readIntelligenceConfig(path: string): unknown {
+  const content = readFileSync(path, "utf8");
+  try {
+    return JSON.parse(content) as unknown;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(`Invalid JSON in subagent intelligence config ${path}: ${detail}`);
+  }
+}
+
+function loadIntelligenceLevels(
+  configPath = INTELLIGENCE_CONFIG_PATH,
+  examplePath = INTELLIGENCE_CONFIG_EXAMPLE_PATH,
+): Record<string, IntelligenceLevel> {
+  const defaults = parseIntelligenceLevels(readIntelligenceConfig(examplePath), examplePath);
+  if (!existsSync(configPath)) return defaults;
+  return { ...defaults, ...parseIntelligenceLevels(readIntelligenceConfig(configPath), configPath) };
+}
+
+function resolveIntelligenceSettings(
+  agentDefs: AgentDefaults | null | undefined,
+  levels?: Record<string, IntelligenceLevel>,
+  agentName = "subagent",
+): Pick<AgentDefaults, "model" | "thinking"> {
+  if (!agentDefs) return {};
+
+  let level: IntelligenceLevel | undefined;
+  if (agentDefs.intelligenceLevel !== undefined) {
+    const catalog = levels ?? loadIntelligenceLevels();
+    if (Object.hasOwn(catalog, agentDefs.intelligenceLevel)) {
+      level = catalog[agentDefs.intelligenceLevel];
+    }
+    if (!level) {
+      throw new Error(
+        `Unknown intelligence level "${agentDefs.intelligenceLevel}" for agent "${agentName}". ` +
+          `Add it to ${INTELLIGENCE_CONFIG_PATH} under intelligenceLevels.`,
+      );
+    }
+  }
+
+  return {
+    model: agentDefs.model ?? level?.model,
+    thinking: agentDefs.thinking ?? level?.thinking,
+  };
+}
+
+function saveIntelligenceLevel(
+  name: string,
+  level: IntelligenceLevel,
+  configPath = INTELLIGENCE_CONFIG_PATH,
+  examplePath = INTELLIGENCE_CONFIG_EXAMPLE_PATH,
+): void {
+  const source = existsSync(configPath) ? configPath : examplePath;
+  const root = readIntelligenceConfig(source);
+  const userLevels = existsSync(configPath) ? parseIntelligenceLevels(root, source) : {};
+  const validated = parseIntelligenceLevels({ intelligenceLevels: { [name]: level } }, configPath)[name];
+  const config = {
+    ...(root as Record<string, unknown>),
+    intelligenceLevels: { ...userLevels, [name]: validated },
+  };
+  const temporaryPath = `${configPath}.${process.pid}.tmp`;
+
+  try {
+    writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, "utf8");
+    renameSync(temporaryPath, configPath);
+  } finally {
+    try { unlinkSync(temporaryPath); } catch {}
+  }
+}
+
+const THINKING_LEVEL_CHOICES = [
+  ["off", "No reasoning"],
+  ["minimal", "Very brief reasoning (~1k tokens)"],
+  ["low", "Light reasoning (~2k tokens)"],
+  ["medium", "Moderate reasoning (~8k tokens)"],
+  ["high", "Deep reasoning (~16k tokens)"],
+  ["xhigh", "Extra-high reasoning (~32k tokens)"],
+  ["max", "Maximum reasoning"],
+] as const;
+
+type NativeModelSelectorConstructor = {
+  new (...args: any[]): ModelSelectorComponent;
+  length: number;
+};
+
+function createIntelligenceModelSelector(
+  tui: any,
+  currentModel: any,
+  modelRegistry: ExtensionContext["modelRegistry"],
+  onSelect: (model: any) => void,
+  onCancel: () => void,
+  Selector = ModelSelectorComponent as unknown as NativeModelSelectorConstructor,
+): ModelSelectorComponent {
+  if (Selector.length >= 9) {
+    // Pi 0.87's native picker takes ModelRuntime; the extension API exposes only
+    // ModelRegistry, so adapt the read/refresh methods the selector uses.
+    const modelRuntime = {
+      getAvailableSnapshot: () => modelRegistry.getAvailable(),
+      getModel: (provider: string, id: string) => modelRegistry.find(provider, id),
+      getError: () => modelRegistry.getError(),
+      async refresh(options?: unknown) {
+        const result = await (modelRegistry as any).refresh(options);
+        return result ?? { aborted: false, errors: new Map() };
+      },
+    };
+    return new Selector(tui, currentModel, modelRuntime, [], onSelect, onCancel);
+  }
+
+  // Older native pickers write the selected default through SettingsManager.
+  return new Selector(
+    tui,
+    currentModel,
+    SettingsManager.inMemory(),
+    modelRegistry,
+    [],
+    onSelect,
+    onCancel,
+  );
+}
+
+async function selectIntelligenceModel(
+  ui: ExtensionContext["ui"],
+  modelRegistry: ExtensionContext["modelRegistry"],
+  currentModel?: string,
+): Promise<string | undefined> {
+  const availableModels = modelRegistry.getAvailable();
+  if (availableModels.length === 0) {
+    ui.notify("No available models. Configure a provider in Pi before editing intelligence levels.", "warning");
+    return undefined;
+  }
+
+  const providerEnd = currentModel?.indexOf("/") ?? -1;
+  const current = currentModel && providerEnd > 0
+    ? modelRegistry.find(currentModel.slice(0, providerEnd), currentModel.slice(providerEnd + 1))
+    : undefined;
+  const currentIsAvailable = current !== undefined && availableModels.some(
+    (model) => model.provider === current.provider && model.id === current.id,
+  );
+  if (currentModel && !currentIsAvailable) {
+    ui.notify(
+      `Configured model "${currentModel}" is unavailable in Pi. Choose an available model or cancel.`,
+      "warning",
+    );
+  }
+
+  return ui.custom<string | undefined>((tui, _theme, _keybindings, done) =>
+    createIntelligenceModelSelector(
+      tui,
+      currentIsAvailable ? current : undefined,
+      modelRegistry,
+      (model) => done(`${model.provider}/${model.id}`),
+      () => done(undefined),
+    ),
+  );
+}
+
+async function selectIntelligenceThinking(
+  ui: ExtensionContext["ui"],
+  currentThinking?: string,
+): Promise<string | undefined> {
+  const values = [...THINKING_LEVEL_CHOICES.map(([value]) => value)];
+  if (currentThinking && !values.includes(currentThinking as typeof values[number])) values.push(currentThinking);
+
+  const choices = [
+    { value: "", label: `${currentThinking ? "  " : "✓ "}Model default` },
+    ...values.map((value) => {
+      const description = THINKING_LEVEL_CHOICES.find(([known]) => known === value)?.[1] ?? "Custom configured level";
+      return {
+        value,
+        label: `${value === currentThinking ? "✓ " : "  "}${value} — ${description}`,
+      };
+    }),
+  ];
+  const selected = await ui.select("Thinking effort", choices.map((choice) => choice.label));
+  return selected === undefined ? undefined : choices.find((choice) => choice.label === selected)?.value;
+}
+
+async function manageIntelligenceLevels(
+  context: Pick<ExtensionContext, "ui" | "modelRegistry">,
+  configPath = INTELLIGENCE_CONFIG_PATH,
+  examplePath = INTELLIGENCE_CONFIG_EXAMPLE_PATH,
+): Promise<void> {
+  const { ui, modelRegistry } = context;
+  while (true) {
+    try {
+      const action = await ui.select("Subagent settings · intelligence levels", [
+        "Add intelligence level",
+        "Edit intelligence level",
+        "Done",
+      ]);
+      if (!action || action === "Done") return;
+
+      if (action === "Add intelligence level") {
+        const nameInput = await ui.input("Level name", "e.g. careful");
+        if (nameInput === undefined) continue;
+        const name = nameInput.trim();
+        if (!name) throw new Error("Level name cannot be blank.");
+        if (Object.hasOwn(loadIntelligenceLevels(configPath, examplePath), name)) {
+          throw new Error(`Level "${name}" already exists. Choose Edit intelligence level to change it.`);
+        }
+
+        const model = await selectIntelligenceModel(ui, modelRegistry);
+        if (model === undefined) continue;
+        const thinking = await selectIntelligenceThinking(ui);
+        if (thinking === undefined) continue;
+        saveIntelligenceLevel(name, {
+          model,
+          ...(thinking ? { thinking } : {}),
+        }, configPath, examplePath);
+        ui.notify(`Saved "${name}". Use intelligence-level: ${name} in an agent profile.`, "info");
+        continue;
+      }
+
+      if (action !== "Edit intelligence level") continue;
+      const entries = Object.entries(loadIntelligenceLevels(configPath, examplePath));
+      const options = entries.map(
+        ([name, level], index) =>
+          `${index + 1}. ${name} — ${level.model} (${level.thinking ?? "model default"})`,
+      );
+      const selected = await ui.select("Choose an intelligence level", options);
+      const index = selected ? options.indexOf(selected) : -1;
+      if (index < 0) continue;
+
+      const [name, level] = entries[index];
+      const field = await ui.select(`Edit ${name}`, ["Model", "Thinking", "Back"]);
+      if (!field || field === "Back") continue;
+
+      if (field === "Model") {
+        const model = await selectIntelligenceModel(ui, modelRegistry, level.model);
+        if (model === undefined) continue;
+        saveIntelligenceLevel(name, { ...level, model }, configPath, examplePath);
+      } else if (field === "Thinking") {
+        const thinking = await selectIntelligenceThinking(ui, level.thinking);
+        if (thinking === undefined) continue;
+        saveIntelligenceLevel(name, {
+          model: level.model,
+          ...(thinking ? { thinking } : {}),
+        }, configPath, examplePath);
+      } else {
+        continue;
+      }
+      ui.notify(`Updated "${name}".`, "info");
+    } catch (error) {
+      ui.notify(error instanceof Error ? error.message : String(error), "error");
+    }
+  }
+}
+
 function parseAgentDefinition(content: string, fallbackName: string): AgentDefinition | null {
   const match = content.match(/^---\n([\s\S]*?)\n---/);
   if (!match) return null;
@@ -314,6 +630,7 @@ function parseAgentDefinition(content: string, fallbackName: string): AgentDefin
     name: getFrontmatterValue(frontmatter, "name") ?? fallbackName,
     description: getFrontmatterValue(frontmatter, "description"),
     model: getFrontmatterValue(frontmatter, "model"),
+    intelligenceLevel: getFrontmatterValue(frontmatter, "intelligence-level"),
     allowModelOverride: parseOptionalBoolean(
       getFrontmatterValue(frontmatter, "allow-model-override"),
     ),
@@ -1443,6 +1760,15 @@ export const __test__ = {
   renderSubagentWidgetLines,
   loadAgentDefaults,
   discoverAgentDefinitions,
+  parseAgentDefinition,
+  parseIntelligenceLevels,
+  loadIntelligenceLevels,
+  resolveIntelligenceSettings,
+  saveIntelligenceLevel,
+  createIntelligenceModelSelector,
+  selectIntelligenceModel,
+  selectIntelligenceThinking,
+  manageIntelligenceLevels,
   resolveEffectiveSessionMode,
   resolveLaunchBehavior,
   resolveEffectiveInteractive,
@@ -1501,11 +1827,13 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const modelSelection = resolveEffectiveModel(params, agentDefs);
+  const intelligence = resolveIntelligenceSettings(agentDefs, undefined, params.agent);
+  const modelAgentDefs = agentDefs ? { ...agentDefs, ...intelligence } : agentDefs;
+  const modelSelection = resolveEffectiveModel(params, modelAgentDefs);
   const effectiveModel = modelSelection.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
-  const effectiveThinking = agentDefs?.thinking;
+  const effectiveThinking = intelligence.thinking;
   const effectiveInteractive = resolveEffectiveInteractive(params, agentDefs);
 
   const sessionFile = ctx.sessionManager.getSessionFile();
@@ -2378,10 +2706,8 @@ async function openSubagentMenu(
     "Spawn subagent",
     "List available subagents",
     "View metrics",
-    "Use current tab",
-    "Use separate tab (hidden)",
-    "Show subagent view",
-    "Hide subagent view",
+    "Display",
+    "Config",
   ]);
   if (!choice) return;
 
@@ -2400,20 +2726,42 @@ async function openSubagentMenu(
     case "View metrics":
       ctx.ui.notify(formatSubagentMetrics(ctx), "info");
       return;
-    case "Use current tab":
-      setSubagentLayout(false, (message) => ctx.ui.notify(message, "info"));
-      return;
-    case "Use separate tab (hidden)":
-      setSubagentLayout(true, (message) => ctx.ui.notify(message, "info"));
-      return;
-    case "Show subagent view": {
-      const ok = showSubagentView(ctx);
-      ctx.ui.notify(ok ? "Subagent view shown" : "No active subagent view found", ok ? "info" : "warning");
+    case "Display": {
+      const displayChoice = await ctx.ui.select("Subagents · Display", [
+        "Use current tab",
+        "Use separate tab (hidden)",
+        "Show subagent view",
+        "Hide subagent view",
+      ]);
+      if (!displayChoice) return;
+      switch (displayChoice) {
+        case "Use current tab":
+          setSubagentLayout(false, (message) => ctx.ui.notify(message, "info"));
+          return;
+        case "Use separate tab (hidden)":
+          setSubagentLayout(true, (message) => ctx.ui.notify(message, "info"));
+          return;
+        case "Show subagent view": {
+          const ok = showSubagentView(ctx);
+          ctx.ui.notify(ok ? "Subagent view shown" : "No active subagent view found", ok ? "info" : "warning");
+          return;
+        }
+        case "Hide subagent view": {
+          const ok = hideSubagentView();
+          ctx.ui.notify(ok ? "Subagent view hidden" : "Unable to focus the parent pane", ok ? "info" : "warning");
+          return;
+        }
+      }
       return;
     }
-    case "Hide subagent view": {
-      const ok = hideSubagentView();
-      ctx.ui.notify(ok ? "Subagent view hidden" : "Unable to focus the parent pane", ok ? "info" : "warning");
+    case "Config": {
+      const configChoice = await ctx.ui.select("Subagents · Config", ["Intelligence"]);
+      if (configChoice !== "Intelligence") return;
+      if (ctx.hasUI === false) {
+        ctx.ui.notify("Intelligence settings require an interactive or RPC UI.", "warning");
+        return;
+      }
+      await manageIntelligenceLevels(ctx);
       return;
     }
   }

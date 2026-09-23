@@ -17,7 +17,7 @@ Async subagents for [pi](https://github.com/badlogic/pi-mono), running in Herdr 
 
 Spawn several in parallel — they run concurrently and steer results back independently as each finishes.
 
-Use `/subagent` to open the subagent menu. It controls spawning, listing agents, metrics, pane layout, and showing or hiding the subagent view. Separate mode leaves the original tab untouched, puts all subagents in one unfocused tab named `S <original tab label>`, and reuses that tab for nested subagents.
+Use `/subagent` to open the subagent menu. It controls spawning, listing agents, and metrics; pane layout and subagent-view controls are grouped under **Display**. **Config → Intelligence** opens the named intelligence-level editor. Separate mode leaves the original tab untouched, puts all subagents in one unfocused tab named `S <original tab label>`, and reuses that tab for nested subagents.
 
 Panes are kept evenly sized by the selected backend. tmux uses its `SUBAGENT_TMUX_LAYOUT`; Herdr uses the installed Pane Balancer plugin.
 
@@ -108,9 +108,10 @@ You are a specialized agent that does X...
 | ----- | ---- | ----------- |
 | `name` | string | Agent name (used in `agent: "my-agent"`) |
 | `description` | string | Shown in `subagents_list` |
-| `model` | string | Default model; named agents require an explicit model |
-| `allow-model-override` | boolean | Defaults to `false`; allow callers to replace the profile model |
-| `thinking` | string | `minimal`, `low`, `medium`, or `high` |
+| `model` | string | Explicit default model; may be omitted when `intelligence-level` is set |
+| `intelligence-level` | string | Name of a model/thinking preset from the intelligence catalog |
+| `allow-model-override` | boolean | Defaults to `false`; allow callers to replace the resolved profile model |
+| `thinking` | string | Explicit thinking override, e.g. `minimal`, `low`, `medium`, or `high` |
 | `tools` | string | Strict tool allowlist. Built-ins: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`. Extension-backed: `web_search`, `source_check`, `fetch_content`, `get_search_content`, `safe_bash`, `video_extract`, `youtube_search`, `google_image_search`. Only the extensions backing the listed tools are loaded into the child |
 | `extensions` | string | Comma-separated absolute extension paths to load inside a restricted child, such as the extension that registers its model provider |
 | `subagent_agents` | string | Comma-separated agent names this agent may spawn. **Presence of this field grants the spawning toolset** (`subagent`, `subagent_message`, `subagents_list`) and restricts spawn targets to the list. Omit it and the agent cannot spawn at all |
@@ -122,6 +123,12 @@ You are a specialized agent that does X...
 | `cwd` | string | Default working directory |
 | `disable-model-invocation` | boolean | Hide from `subagents_list`; still spawnable by explicit name |
 | `cli` | string | `claude` runs the agent via the Claude Code CLI instead of pi |
+
+### Intelligence levels
+
+Manage named model/thinking presets from `/subagent` → **Config** → **Intelligence**. Add any level name, then edit its model or thinking setting. Model selection uses Pi's native searchable `/model` picker and does not change the parent session's model; thinking effort is selected from a menu, including **Model default**. Agent profiles can reference the name with `intelligence-level: <name>`; explicit `model` and `thinking` frontmatter values take precedence over the catalog. A `/subagent` model override still follows the profile's `allow-model-override` setting. Changes are read for the next spawn, and already-running subagents keep their resolved settings for resume.
+
+The extension loads defaults from `config.json.example` and merges user overrides from `config.json` in the extension directory (gitignored). The default catalog includes `low`, `mid`, and `high`; add custom names such as `careful custom` in the editor or directly in `config.json`.
 
 ### session-mode
 
@@ -171,11 +178,16 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (with `question`, `input`, `child results`, or `after turn` detail), `done` (the agent finished but the child process is still closing), `stalled` (no valid snapshot or unanswered status check), or `running` (fallback). After an autonomous child is settled for 60 seconds without exiting, the parent sends one status-only nudge: use `ask_question` if input is needed, otherwise report completion/failure and exit. This never kills the child or retries work; an unanswered nudge becomes observational `stalled`. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
-Status display is configured via `config.json` in the extension directory (copy `config.json.example`; it's gitignored):
+Status display and intelligence levels are configured via `config.json` in the extension directory (gitignored). Defaults are shown in `config.json.example`; preserve other top-level settings when editing the file:
 
 ```json
 {
-  "status": { "enabled": true }
+  "status": { "enabled": true },
+  "intelligenceLevels": {
+    "low": { "model": "openrouter/z-ai/glm-5.3", "thinking": "low" },
+    "mid": { "model": "openrouter/z-ai/glm-5.3", "thinking": "medium" },
+    "high": { "model": "openrouter/z-ai/glm-5.3", "thinking": "high" }
+  }
 }
 ```
 
