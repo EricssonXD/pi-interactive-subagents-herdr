@@ -7,6 +7,8 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@mariozechner/pi-tui";
+import { captureChildUsage, registerChildUsage, preloadUsageCollector, readUsageDescriptor, usageDescriptorPath, childUsageDetails } from "./usage.ts";
+import type { CapturedUsage, ChildDescriptor } from "./usage.ts";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -986,6 +988,7 @@ function lifecycleRecordFor(
     ...(running.model ? { model: running.model } : {}),
     ...(running.modelSource ? { modelSource: running.modelSource } : {}),
     interactive: running.interactive,
+    ...(running.usageDescriptor ? { usageDescriptor: running.usageDescriptor, usageDescriptorFile: running.usageDescriptorFile, usageAccounting: "pending" as const } : {}),
     status: "running",
     updatedAt: Date.now(),
   };
@@ -1029,6 +1032,8 @@ function runningFromLifecycle(record: ChildLifecycleRecord): RunningSubagent {
     model: record.model,
     modelSource: record.modelSource,
     interactive: record.interactive,
+    usageDescriptor: record.usageDescriptor,
+    usageDescriptorFile: record.usageDescriptorFile,
     statusState: createStatusState({ source: record.cli === "claude" ? "claude" : "pi", startTimeMs: record.startTime }),
   };
 }
@@ -1089,6 +1094,8 @@ function deliverResultAndDeleteSession(
     ? readChildLifecycleRecord(join(artifactDir, "subagent-lifecycle", `${childId}.json`))
     : findChildLifecycleRecord(artifactDir, name, sessionFile);
   const stableId = childId ?? lifecycle?.id;
+  const metadata = childUsageDetails(lifecycle?.usageDescriptor, latestPi?.events, lifecycle?.cli);
+  message = { ...message, details: { ...message.details, ...metadata }, ...(metadata.usageContext ? { usageContext: metadata.usageContext } : {}) };
   if (
     stableId &&
     protectedSessionFile &&
@@ -1097,6 +1104,7 @@ function deliverResultAndDeleteSession(
     updateChildLifecycleRecord(artifactDir, stableId, { status: "delivered" });
     deleteDeliveredSubagentSession(artifactDir, name, sessionFile, protectedSessionFile);
     publishHerdrChildWork();
+    if (pendingAccountingRecords().length > 0) startStatusRefresh(latestPi ?? pi as ExtensionAPI);
     return;
   }
 
@@ -1111,6 +1119,7 @@ function deliverResultAndDeleteSession(
   if (stableId) updateChildLifecycleRecord(artifactDir, stableId, { status: "delivered" });
   deleteDeliveredSubagentSession(artifactDir, name, sessionFile, protectedSessionFile);
   publishHerdrChildWork();
+  if (pendingAccountingRecords().length > 0) startStatusRefresh(latestPi ?? pi as ExtensionAPI);
 }
 
 /**
@@ -1176,6 +1185,8 @@ interface RunningSubagent {
   interactive: boolean;
   /** Stable id is persisted before the child is watched and survives reloads. */
   childId?: string;
+  usageDescriptor?: ChildDescriptor;
+  usageDescriptorFile?: string;
   model?: string;
   modelSource?: "profile" | "override";
 }
@@ -1682,11 +1693,36 @@ function maybeMarkStatusUnresponsive(running: RunningSubagent, now: number): str
   return `${running.name} did not respond to the status check; the child may be unresponsive.`;
 }
 
-function startStatusRefresh(pi: ExtensionAPI) {
-  if (!statusConfig.enabled || statusInterval) return;
+function pendingAccountingRecords(): ChildLifecycleRecord[] {
+  if (!latestCtx) return [];
+  const parent = latestCtx.sessionManager.getSessionFile();
+  const artifactDir = getArtifactDir(latestCtx.sessionManager.getSessionDir(), latestCtx.sessionManager.getSessionId());
+  const registry = readNameRegistry(artifactDir);
+  return listChildLifecycleRecords(artifactDir).filter(record => record.parentSessionFile === parent && record.status === "delivered" && (record.usageDescriptor || record.usageDescriptorFile || existsSync(usageDescriptorPath(record.sessionFile))) && registry[record.name]?.sessionFile === record.sessionFile);
+}
 
+function startStatusRefresh(pi: ExtensionAPI) {
+  if (statusInterval || !statusConfig.enabled && pendingAccountingRecords().length === 0) return;
+
+  let accountingRetry = false;
   statusInterval = setInterval(() => {
-    if (runningSubagents.size === 0) {
+    if (!accountingRetry && pendingAccountingRecords().length > 0) {
+      accountingRetry = true;
+      const context = latestCtx!;
+      const abort = getModuleAbortSignal();
+      void (async () => {
+        const artifactDir = getArtifactDir(context.sessionManager.getSessionDir(), context.sessionManager.getSessionId());
+        for (const record of pendingAccountingRecords()) {
+          const path = record.usageDescriptorFile ?? usageDescriptorPath(record.sessionFile);
+          const descriptor = record.usageDescriptor ?? readUsageDescriptor(path);
+          if (descriptor) await preloadUsageCollector(descriptor, path);
+          if (abort.aborted || latestCtx !== context) return;
+          // Accounting-only retry: no result delivery, even when visual status is disabled.
+          deleteDeliveredSubagentSession(artifactDir, record.name, record.sessionFile, record.parentSessionFile);
+        }
+      })().catch(() => {}).finally(() => { accountingRetry = false; });
+    }
+    if (runningSubagents.size === 0 && pendingAccountingRecords().length === 0) {
       if (statusInterval) {
         clearInterval(statusInterval);
         statusInterval = null;
@@ -1695,6 +1731,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       return;
     }
 
+    if (!statusConfig.enabled) return;
     const transitionLines: string[] = [];
     const now = Date.now();
     let shouldRefreshWidget = false;
@@ -1730,7 +1767,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
           customType: "subagent_status",
           content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
           display: true,
-          details: { lines: capped.visibleLines, overflow: capped.overflow },
+          details: { lines: capped.visibleLines, overflow: capped.overflow, children: Array.from(runningSubagents.values(), running => ({ id: running.childId, ...childUsageDetails(running.usageDescriptor, pi.events, running.cli) })) },
         },
         { triggerTurn: true, deliverAs: "steer" },
       );
@@ -1788,6 +1825,12 @@ export const __test__ = {
   handleSubagentSteer,
   resolveResultPresentation,
   deliverResultAndDeleteSession,
+  launchSubagent,
+  reconcileChildLifecycles,
+  startReconciledChild,
+  pendingAccountingRecords,
+  startStatusRefresh,
+  statusConfig,
   resolveResumeLaunchBehavior,
   commandWithCompletionSidecar,
   publishHerdrChildWork,
@@ -1821,8 +1864,9 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; capturedUsage?: CapturedUsage },
 ): Promise<RunningSubagent> {
+  const usage = options?.capturedUsage ?? captureChildUsage(latestPi?.events);
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
 
@@ -1863,14 +1907,7 @@ async function launchSubagent(
   ].join("-");
   const subagentSessionFile = join(sessionDir, `${timestamp}_${uuid}.jsonl`);
 
-  // Use pre-created surface (parallel mode) or create a new one.
-  // For new surfaces, pause briefly so the shell is ready before sending the command.
-  const surfacePreCreated = !!options?.surface;
-  const surface = options?.surface ?? createSurface(params.name);
-  if (!surfacePreCreated) {
-    await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
-  }
-
+  // Ownership above is immutable before any pane creation or await.
   const launchBehavior = resolveLaunchBehavior(params, agentDefs);
 
   if (launchBehavior.seededSessionMode) {
@@ -1881,6 +1918,10 @@ async function launchSubagent(
       childCwd: targetCwdForSession,
     });
   }
+
+  const tracking = agentDefs?.cli === "claude" ? undefined : await registerChildUsage(usage, { sessionPath: subagentSessionFile, childId: id, startedAt: startTime, project: effectiveCwd ?? ctx.cwd });
+  const surface = options?.surface ?? createSurface(params.name);
+  if (!options?.surface) await new Promise<void>((resolve) => setTimeout(resolve, getShellReadyDelayMs()));
 
   const activityFile = getSubagentActivityFile(artifactDir, id);
   mkdirSync(dirname(activityFile), { recursive: true });
@@ -2000,6 +2041,7 @@ async function launchSubagent(
 
   const subagentDonePath = join(SUBAGENTS_DIR, "subagent-done.ts");
   parts.push("-e", shellEscape(subagentDonePath));
+  if (tracking) parts.push("-e", shellEscape(tracking.usageDescriptor.collectorPath));
 
   // Resolve the config dir the child sees: a target-local .pi/agent/ wins,
   // else the propagated global dir. Captured once so the launch env and the
@@ -2039,7 +2081,7 @@ async function launchSubagent(
   applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
-  const envParts: string[] = [];
+  const envParts: string[] = [tracking ? `PI_USAGE_DESCRIPTOR=${shellEscape(tracking.usageDescriptorFile)}` : "PI_USAGE_DESCRIPTOR="];
 
   if (resolvedAgentDir) {
     envParts.push(`PI_CODING_AGENT_DIR=${shellEscape(resolvedAgentDir)}`);
@@ -2134,6 +2176,7 @@ async function launchSubagent(
     modelSource: modelSelection.source,
     lifecycleArtifactDir: artifactDir,
     parentSessionFile: sessionFile,
+    ...tracking,
     interactive: effectiveInteractive,
     statusState: createStatusState({
       source: "pi",
@@ -2204,6 +2247,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
         agent: running.agent,
         question: payload.question,
         ...(sessionId ? { sessionId } : {}),
+        ...childUsageDetails(running.usageDescriptor, latestPi?.events, running.cli),
       },
     },
     { triggerTurn: true, deliverAs: "steer" },
@@ -2468,6 +2512,14 @@ async function reconcileChildLifecycles(
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
   for (const record of listChildLifecycleRecords(artifactDir)) {
     if (record.parentSessionFile !== parentSessionFile) continue;
+    const descriptorFile = record.usageDescriptorFile ?? usageDescriptorPath(record.sessionFile);
+    const descriptor = record.usageDescriptor ?? readUsageDescriptor(descriptorFile);
+    if (descriptor) {
+      record.usageDescriptor = descriptor;
+      record.usageDescriptorFile = descriptorFile;
+      await preloadUsageCollector(descriptor, descriptorFile);
+      if (getModuleAbortSignal().aborted) return;
+    }
     if (record.status !== "delivered") {
       // Repair the name index if the parent stopped between lifecycle
       // persistence and registerName (or while rewriting the registry).
@@ -2479,6 +2531,7 @@ async function reconcileChildLifecycles(
     }
     startReconciledChild(pi, record, artifactDir, parentSessionFile);
   }
+  if (pendingAccountingRecords().length > 0) startStatusRefresh(pi);
   if (runningSubagents.size > 0) {
     startWidgetRefresh();
     startStatusRefresh(pi);
@@ -2931,7 +2984,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // from then on uniqueRunningName tracks it via the running map.
         let running;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await launchSubagent(params, ctx, { capturedUsage: captureChildUsage(pi.events, _toolCallId) });
         } finally {
           if (reservedName) reservedNames.delete(reservedName);
         }
@@ -3212,6 +3265,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (!requestedName) {
           const err = "Provide the running subagent's `name`.";
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        // Accounting evidence is not resumable. Check before mux probes, id creation, or any await.
+        const pendingParent = ctx.sessionManager.getSessionFile();
+        if (pendingParent) {
+          const pendingArtifact = getArtifactDir(ctx.sessionManager.getSessionDir(), ctx.sessionManager.getSessionId());
+          const pendingEntry = resolveNameInRegistry(pendingArtifact, requestedName);
+          const pendingLifecycle = pendingEntry ? findChildLifecycleRecord(pendingArtifact, requestedName, pendingEntry.sessionFile) : null;
+          if (pendingLifecycle?.status === "delivered" && (pendingLifecycle.usageDescriptor || pendingLifecycle.usageDescriptorFile || existsSync(usageDescriptorPath(pendingLifecycle.sessionFile)))) {
+            const err = `Subagent "${requestedName}" has accounting pending or unresolved cleanup. Its original session is retained for reconciliation; spawn a fresh child for new work.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: err, id: pendingLifecycle.id, usageAccounting: "pending" } };
+          }
         }
 
         if (!isMuxAvailable()) {

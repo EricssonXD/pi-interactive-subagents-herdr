@@ -15,6 +15,8 @@ import {
 } from "node:fs";
 import { randomBytes, randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
+import { reconcileChildUsage, readUsageDescriptor, usageDescriptorPath } from "./usage.ts";
+import type { ChildDescriptor } from "./usage.ts";
 
 export interface SessionEntry {
   type: string;
@@ -190,6 +192,10 @@ export interface ChildLifecycleRecord {
   status: ChildLifecycleStatus;
   updatedAt: number;
   result?: Record<string, unknown>;
+  /** Prompt-free tracking evidence captured before launch; absent on legacy children. */
+  usageDescriptor?: ChildDescriptor;
+  usageDescriptorFile?: string;
+  usageAccounting?: "pending" | "complete";
 }
 
 export function childLifecycleDir(artifactDir: string): string {
@@ -390,8 +396,25 @@ export function deleteDeliveredSubagentSession(
       )
     ) return;
 
+    const childId = registry[name]?.childId;
+    const lifecycle = childId
+      ? readChildLifecycleRecord(childLifecyclePath(artifactDir, childId))
+      : findChildLifecycleRecord(artifactDir, name, sessionFile);
+    const descriptorFile = lifecycle?.usageDescriptorFile ?? usageDescriptorPath(sessionFile);
+    const descriptor = lifecycle?.usageDescriptor ?? readUsageDescriptor(descriptorFile);
+    if (descriptor || lifecycle?.usageDescriptorFile || existsSync(descriptorFile)) {
+      // One shared guard covers live, restored, and already-delivered cleanup.
+      // No loaded adapter or uncertain state is a durable pending cleanup, never permission to delete.
+      if (!descriptor || descriptor.sessionPath !== target || reconcileChildUsage(descriptor) !== "complete") {
+        if (lifecycle) updateChildLifecycleRecord(artifactDir, lifecycle.id, { usageAccounting: "pending" });
+        return;
+      }
+      if (lifecycle) updateChildLifecycleRecord(artifactDir, lifecycle.id, { usageAccounting: "complete" });
+    }
+
     for (const path of [
       sessionFile,
+      descriptorFile,
       loadoutSidecarPath(sessionFile),
       `${sessionFile}.ask`,
       `${sessionFile}.exit`,
