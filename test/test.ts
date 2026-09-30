@@ -241,6 +241,47 @@ const TOOL_RESULT = {
 
 // --- Tests ---
 
+describe("Herdr subagent notification markers", () => {
+  it("registers a subagent pane before status events and grants shutdown delivery time", () => {
+    withTempDir((dir) => {
+      const env = {
+        HERDR_ENV: process.env.HERDR_ENV,
+        HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+        HERDR_PLUGIN_STATE_DIR: process.env.HERDR_PLUGIN_STATE_DIR,
+        PI_SUBAGENT_ID: process.env.PI_SUBAGENT_ID,
+      };
+      const handlers = new Map<string, (event: any, ctx: any) => void>();
+      try {
+        process.env.HERDR_ENV = "1";
+        process.env.HERDR_PANE_ID = "w1:p2";
+        process.env.HERDR_PLUGIN_STATE_DIR = dir;
+        process.env.PI_SUBAGENT_ID = "child-1";
+        subagentDoneExtension({
+          on(event: string, handler: (event: any, ctx: any) => void) {
+            handlers.set(event, handler);
+          },
+          registerShortcut() {},
+          registerTool() {},
+        } as any);
+
+        const marker = join(dir, "subagent-pane-77313a7032.json");
+        assert.deepEqual(JSON.parse(readFileSync(marker, "utf8")), {
+          pid: process.pid,
+          shutdown_until_ms: null,
+        });
+        handlers.get("session_shutdown")!({ reason: "quit" }, {});
+        assert.ok(JSON.parse(readFileSync(marker, "utf8")).shutdown_until_ms > Date.now());
+      } finally {
+        restoreEnvVar("HERDR_ENV", env.HERDR_ENV);
+        restoreEnvVar("HERDR_PANE_ID", env.HERDR_PANE_ID);
+        restoreEnvVar("HERDR_PLUGIN_STATE_DIR", env.HERDR_PLUGIN_STATE_DIR);
+        restoreEnvVar("PI_SUBAGENT_ID", env.PI_SUBAGENT_ID);
+      }
+    });
+  });
+
+});
+
 describe("session.ts", () => {
   let dir: string;
 

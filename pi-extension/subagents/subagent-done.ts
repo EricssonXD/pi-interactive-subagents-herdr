@@ -15,8 +15,38 @@
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { mkdirSync, renameSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createSubagentActivityRecorder } from "./activity.ts";
+
+// ponytail: 2-minute post-exit grace; use Herdr event acknowledgements for a stronger delivery guarantee.
+const SUBAGENT_NOTIFICATION_GRACE_MS = 2 * 60 * 1000;
+
+function writeSubagentNotificationMarker(
+  paneId: string,
+  pid: number,
+  shutdownUntilMs: number | null,
+  stateDir: string,
+): string {
+  const markerPath = join(
+    stateDir,
+    `subagent-pane-${Buffer.from(paneId, "utf8").toString("hex")}.json`,
+  );
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+  const tempPath = `${markerPath}.${pid}.tmp`;
+  writeFileSync(
+    tempPath,
+    JSON.stringify({ pid, shutdown_until_ms: shutdownUntilMs }),
+    { mode: 0o600 },
+  );
+  renameSync(tempPath, markerPath);
+  return markerPath;
+}
+
+function herdrStateDir(): string {
+  return process.env.HERDR_PLUGIN_STATE_DIR || join(tmpdir(), "herdr-focus-notify");
+}
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -124,6 +154,17 @@ export default function (pi: ExtensionAPI) {
     runningChildId: process.env.PI_SUBAGENT_ID,
     activityFile: process.env.PI_SUBAGENT_ACTIVITY_FILE,
   });
+  const herdrPaneId =
+    process.env.HERDR_ENV === "1" && process.env.PI_SUBAGENT_ID
+      ? process.env.HERDR_PANE_ID
+      : undefined;
+  if (herdrPaneId) {
+    try {
+      writeSubagentNotificationMarker(herdrPaneId, process.pid, null, herdrStateDir());
+    } catch {
+      // Notification suppression is best-effort; never fail a subagent launch.
+    }
+  }
 
   function renderWidget(ctx: { ui: { setWidget: Function } }, _theme: any) {
     ctx.ui.setWidget(
@@ -337,6 +378,18 @@ export default function (pi: ExtensionAPI) {
 
   pi.on("session_shutdown", (event) => {
     recorder.sessionShutdown((event as any).reason);
+    if (herdrPaneId) {
+      try {
+        writeSubagentNotificationMarker(
+          herdrPaneId,
+          process.pid,
+          Date.now() + SUBAGENT_NOTIFICATION_GRACE_MS,
+          herdrStateDir(),
+        );
+      } catch {
+        // Herdr may deliver the final status event after the child exits.
+      }
+    }
   });
 
   // Toggle expand/collapse with Ctrl+Alt+O
