@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
-import { initTheme, ModelSelectorComponent } from "@mariozechner/pi-coding-agent";
+import { initTheme, ModelSelectorComponent, SessionManager } from "@mariozechner/pi-coding-agent";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -37,6 +37,7 @@ import {
   listChildLifecycleRecords,
   readChildLifecycleRecord,
   writeChildLifecycleRecord,
+  parentSessionContainsChildResult,
   type ChildLifecycleRecord,
 } from "../pi-extension/subagents/session.ts";
 
@@ -526,6 +527,103 @@ describe("session.ts", () => {
         assert.equal(existsSync(sessionFile), false);
       });
     });
+
+    it("recognizes native and legacy receipts despite malformed transcript lines", () => {
+      withTempDir((dir) => {
+        const parentFile = createSessionFile(dir, [SESSION_HEADER, ASSISTANT_MSG]);
+        const parent = SessionManager.open(parentFile, dir);
+        parent.appendCustomMessageEntry("subagent_result", "done", true, { id: "native-child" });
+        const nativeTranscript = readFileSync(parentFile, "utf8");
+        assert.equal(parentSessionContainsChildResult(parentFile, "native-child"), true);
+        writeFileSync(parentFile, `not-json\nnull\n\n${nativeTranscript}{"type":`);
+        assert.equal(parentSessionContainsChildResult(parentFile, "native-child"), true);
+
+        for (const entry of [
+          { type: "message", message: { role: "custom", customType: "subagent_result", details: { id: "legacy-child" } } },
+          { role: "custom", customType: "subagent_result", details: { id: "legacy-child" } },
+        ]) {
+          writeFileSync(parentFile, `${JSON.stringify(entry)}\n`);
+          assert.equal(parentSessionContainsChildResult(parentFile, "legacy-child"), true);
+        }
+      });
+    });
+
+    it("rejects unrelated or missing result receipts", () => {
+      withTempDir((dir) => {
+        const parentFile = createSessionFile(dir, [
+          SESSION_HEADER,
+          { type: "custom_message", customType: "subagent_result", details: { id: "other-child" } },
+          { type: "custom_message", customType: "subagent_status", details: { id: "child" } },
+          { type: "custom_message", customType: "subagent_result", details: { id: "child-extra" } },
+          { type: "custom", customType: "subagent_result", data: { id: "child" }, details: { id: "child" } },
+          { type: "message", message: { role: "user", customType: "subagent_result", details: { id: "child" } } },
+          { type: "custom_message", customType: "subagent_result" },
+        ]);
+        assert.equal(parentSessionContainsChildResult(parentFile, "child"), false);
+        assert.equal(parentSessionContainsChildResult(join(dir, "missing.jsonl"), "child"), false);
+        assert.equal(parentSessionContainsChildResult(dir, "child"), false);
+        writeFileSync(parentFile, "\nnot-json\n");
+        assert.equal(parentSessionContainsChildResult(parentFile, "child"), false);
+      });
+    });
+
+    for (const persistedCount of [10, 9]) {
+      it(`reconciles ten finished children with ${persistedCount} persisted receipts without replay`, async () => {
+        const dir = createTestDir();
+        const handlers = new Map<string, (event: any, ctx: any) => any>();
+        const mock = createMockExtensionApi();
+        mock.api.on = (event: string, handler: any) => handlers.set(event, handler);
+        try {
+          const parentFile = createSessionFile(dir, [SESSION_HEADER, ASSISTANT_MSG]);
+          let parent = SessionManager.open(parentFile, dir);
+          const artifactDir = join(dir, "artifacts", parent.getSessionId());
+          for (let i = 0; i < 10; i++) {
+            const id = `child-${i}`;
+            const name = `Worker-${i}`;
+            const sessionFile = join(dir, `${id}.jsonl`);
+            writeFileSync(sessionFile, `${JSON.stringify(SESSION_HEADER)}\n`);
+            writeFileSync(`${sessionFile}.complete`, "0\n");
+            const record: ChildLifecycleRecord = {
+              version: 1, id, parentSessionFile: parentFile, name, task: "finish",
+              surface: `pane-${i}`, startTime: 1, sessionFile, interactive: false,
+              status: i % 3 === 0 ? "delivered" : i % 3 === 1 ? "completed" : "delivering",
+              updatedAt: 1,
+              result: { childId: id, name, task: "finish", summary: "done", exitCode: 0, elapsed: 1 },
+            };
+            writeChildLifecycleRecord(record, artifactDir);
+            registerName(artifactDir, name, { sessionFile, sessionId: "child-session", childId: id });
+            if (i < persistedCount) parent.appendCustomMessageEntry("subagent_result", "done", true, { id });
+          }
+
+          subagentsModule.default(mock.api);
+          const start = handlers.get("session_start")!;
+          await start({ reason: "startup" }, { sessionManager: parent });
+          assert.deepEqual(mock.sentMessages.map(({ message }) => message.details.id), persistedCount === 10 ? [] : ["child-9"]);
+          if (persistedCount === 9) {
+            const { message, options } = mock.sentMessages[0];
+            assert.equal(message.customType, "subagent_result");
+            assert.match(message.content, /done/);
+            assert.deepEqual(options, { triggerTurn: true, deliverAs: "steer" });
+            parent.appendCustomMessageEntry(message.customType, message.content, message.display, message.details);
+          }
+          // Reload and then reopen the transcript as a resumed parent would.
+          await start({ reason: "reload" }, { sessionManager: parent });
+          parent = SessionManager.open(parentFile, dir);
+          await start({ reason: "resume" }, { sessionManager: parent });
+          assert.equal(mock.sentMessages.length, 10 - persistedCount);
+          assert.equal(listChildLifecycleRecords(artifactDir).every((record) => record.status === "delivered"), true);
+          assert.deepEqual(readNameRegistry(artifactDir), {});
+          for (let i = 0; i < 10; i++) {
+            assert.equal(existsSync(join(dir, `child-${i}.jsonl`)), false);
+            assert.equal(existsSync(join(dir, `child-${i}.jsonl.complete`)), false);
+          }
+          assert.equal(existsSync(parentFile), true);
+        } finally {
+          handlers.get("session_shutdown")?.({ reason: "quit" }, {});
+          rmSync(dir, { recursive: true, force: true });
+        }
+      });
+    }
 
     it("can clear a delivery lock left by a crashed parent", () => {
       withTempDir((dir) => {

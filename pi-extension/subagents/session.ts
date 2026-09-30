@@ -301,11 +301,18 @@ export function removeChildLifecycleRecord(artifactDir: string, childId: string)
  */
 export function parentSessionContainsChildResult(parentSessionFile: string, childId: string): boolean {
   try {
-    return readEntries(parentSessionFile).some((entry: any) => {
-      const message = entry?.type === "message" ? entry.message : entry;
-      return message?.role === "custom" &&
-        message?.customType === "subagent_result" &&
-        message?.details?.id === childId;
+    return readFileSync(parentSessionFile, "utf8").split("\n").some((line) => {
+      try {
+        const entry = JSON.parse(line);
+        const message = entry?.type === "message" ? entry.message : entry;
+        // Native persisted custom_message entries have no role field.
+        return (entry?.type === "custom_message" || message?.role === "custom") &&
+          message?.customType === "subagent_result" &&
+          message?.details?.id === childId;
+      } catch {
+        // A malformed or incomplete line must not hide other valid receipts.
+        return false;
+      }
     });
   } catch {
     return false;
