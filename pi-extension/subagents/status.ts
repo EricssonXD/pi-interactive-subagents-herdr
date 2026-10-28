@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 
 export const SNAPSHOT_STALLED_AFTER_MS = 60_000;
 export const STATUS_NUDGE_AFTER_MS = 60_000;
+export const DEFAULT_PROVIDER_STALL_TIMEOUT_MS = 600_000;
 export const DEFAULT_STATUS_LINE_LIMIT = 4;
 export const MAX_STATUS_NAME_LENGTH = 72;
 export const MAX_STATUS_LINE_LENGTH = 120;
@@ -22,6 +23,7 @@ export type StatusActivityPhase = "starting" | "active" | "waiting" | "done";
 export interface StatusConfig {
   enabled: boolean;
   lineLimit: number;
+  providerStallTimeoutMs: number;
 }
 
 export type StatusObservation =
@@ -112,6 +114,13 @@ function requireBoolean(value: unknown, source: string, fieldName: string): bool
   return value;
 }
 
+function requirePositiveInteger(value: unknown, source: string, fieldName: string): number {
+  if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+    invalidStatusConfig(source, `${fieldName} must be a positive integer`);
+  }
+  return value;
+}
+
 function rejectUnsupportedKeys(
   value: Record<string, unknown>,
   allowedKeys: string[],
@@ -152,12 +161,16 @@ function activityLabel(snapshot: Pick<StatusSnapshot, "activityLabel" | "activeS
 export function parseStatusConfig(rawConfig: unknown, source = "config.json"): StatusConfig {
   const config = requireObject(rawConfig, source, "root");
   const status = requireObject(config.status, source, "status");
-  rejectUnsupportedKeys(status, ["enabled"], source, "status");
+  rejectUnsupportedKeys(status, ["enabled", "providerStallTimeoutMs"], source, "status");
   const enabled = requireBoolean(status.enabled, source, "status.enabled");
+  const providerStallTimeoutMs = status.providerStallTimeoutMs === undefined
+    ? DEFAULT_PROVIDER_STALL_TIMEOUT_MS
+    : requirePositiveInteger(status.providerStallTimeoutMs, source, "status.providerStallTimeoutMs");
 
   return {
     enabled,
     lineLimit: DEFAULT_STATUS_LINE_LIMIT,
+    providerStallTimeoutMs,
   };
 }
 

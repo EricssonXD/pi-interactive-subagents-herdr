@@ -176,13 +176,13 @@ Set a per-agent default with `cwd:` in frontmatter.
 
 ## Status widget & configuration
 
-The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (with `question`, `input`, `child results`, or `after turn` detail), `done` (the agent finished but the child process is still closing), `stalled` (no valid snapshot or unanswered status check), or `running` (fallback). After an autonomous child is settled for 60 seconds without exiting, the parent sends one status-only nudge: use `ask_question` if input is needed, otherwise report completion/failure and exit. This never kills the child or retries work; an unanswered nudge becomes observational `stalled`. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
+The widget tracks each sub-agent from a runtime activity snapshot written by the child: `starting`, `active` (turn/provider/tool work), `waiting` (with `question`, `input`, `child results`, or `after turn` detail), `done` (the agent finished but the child process is still closing), `stalled` (no valid snapshot or unanswered status check), or `running` (fallback). After an autonomous child is settled for 60 seconds without exiting, the parent sends one status-only nudge: use `ask_question` if input is needed, otherwise report completion/failure and exit. A separate provider watchdog reports when an active model request has had no activity for 10 minutes by default (`status.providerStallTimeoutMs`). The warning wakes the parent but does not interrupt or kill the child; if it later completes, its normal result is still delivered. This watchdog remains active when the visual status widget is disabled. An unanswered status nudge becomes observational `stalled`. Sub-agent sessions also show their own tools widget — toggle it with `Ctrl+Alt+O`. Completion messages expand with `Ctrl+O`.
 
 Status display and intelligence levels are configured via `config.json` in the extension directory (gitignored). Defaults are shown in `config.json.example`; preserve other top-level settings when editing the file:
 
 ```json
 {
-  "status": { "enabled": true },
+  "status": { "enabled": true, "providerStallTimeoutMs": 600000 },
   "intelligenceLevels": {
     "low": { "model": "openrouter/z-ai/glm-5.3", "thinking": "low" },
     "mid": { "model": "openrouter/z-ai/glm-5.3", "thinking": "medium" },

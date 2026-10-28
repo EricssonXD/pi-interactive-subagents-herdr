@@ -71,6 +71,7 @@ import {
   forceStatusAfterNudge,
   forceStatusUnresponsive,
   STATUS_NUDGE_AFTER_MS,
+  MAX_STATUS_LINE_LENGTH,
   formatStatusAggregate,
   formatTransitionLine,
   observeStatus,
@@ -1176,6 +1177,8 @@ interface RunningSubagent {
   statusNudgeSequence?: number;
   statusNudgeAtMs?: number;
   statusNudgeUnresponsiveReported?: boolean;
+  /** Activity sequence already reported as a quiet provider request. */
+  providerStallReportedSequence?: number;
   /**
    * When true, status transitions (stalled/recovered) do not wake the parent
    * session via a steer message. The widget still updates locally. Used for
@@ -1650,6 +1653,36 @@ function waitingSinceForNudge(activity: SubagentActivityState): number {
     : activity.waitingSince ?? activity.updatedAt;
 }
 
+function maybeReportProviderStall(
+  running: RunningSubagent,
+  now: number,
+  timeoutMs = statusConfig.providerStallTimeoutMs,
+): string | null {
+  if (running.interactive || running.cli === "claude" || running.activityRead?.ok !== true) return null;
+  const activity = running.activity;
+  if (!activity?.providerActive || running.providerStallReportedSequence === activity.sequence) return null;
+  if (now - activity.updatedAt <= timeoutMs) return null;
+  if (existsSync(`${running.sessionFile}.complete`) || existsSync(`${running.sessionFile}.exit`)) return null;
+
+  running.providerStallReportedSequence = activity.sequence;
+  const detail =
+    `: provider may be stalled; quiet ${formatElapsed(Math.floor((now - activity.updatedAt) / 1000))} ` +
+    `(threshold ${formatElapsed(Math.floor(timeoutMs / 1000))}); child remains running.`;
+  const nameLimit = Math.max(1, MAX_STATUS_LINE_LENGTH - detail.length);
+  const name = running.name.length > nameLimit
+    ? `${running.name.slice(0, nameLimit - 1)}…`
+    : running.name;
+  return `${name}${detail}`;
+}
+
+function shouldStartStatusRefresh(
+  statusEnabled: boolean,
+  runningChildCount: number,
+  hasPendingAccounting: boolean,
+): boolean {
+  return statusEnabled || runningChildCount > 0 || hasPendingAccounting;
+}
+
 function shouldNudgeWaitingSubagent(running: RunningSubagent, now: number): boolean {
   if (running.interactive || running.cli === "claude" || running.activityRead?.ok !== true) return false;
   const activity = running.activity;
@@ -1702,7 +1735,8 @@ function pendingAccountingRecords(): ChildLifecycleRecord[] {
 }
 
 function startStatusRefresh(pi: ExtensionAPI) {
-  if (statusInterval || !statusConfig.enabled && pendingAccountingRecords().length === 0) return;
+  const hasPendingAccounting = !statusConfig.enabled && runningSubagents.size === 0 && pendingAccountingRecords().length > 0;
+  if (statusInterval || !shouldStartStatusRefresh(statusConfig.enabled, runningSubagents.size, hasPendingAccounting)) return;
 
   let accountingRetry = false;
   statusInterval = setInterval(() => {
@@ -1731,13 +1765,17 @@ function startStatusRefresh(pi: ExtensionAPI) {
       return;
     }
 
-    if (!statusConfig.enabled) return;
+    const providerStallLines: string[] = [];
     const transitionLines: string[] = [];
     const now = Date.now();
     let shouldRefreshWidget = false;
 
     for (const running of runningSubagents.values()) {
       observeRunningSubagent(running, now);
+      const providerStallLine = maybeReportProviderStall(running, now);
+      if (providerStallLine) providerStallLines.push(providerStallLine);
+      if (!statusConfig.enabled) continue;
+
       const nudgeLine = maybeNudgeWaitingSubagent(running, now);
       if (nudgeLine && !running.interactive) transitionLines.push(nudgeLine);
       const unresponsiveLine = maybeMarkStatusUnresponsive(running, now);
@@ -1758,14 +1796,15 @@ function startStatusRefresh(pi: ExtensionAPI) {
       }
     }
 
-    if (shouldRefreshWidget) updateWidget();
+    if (statusConfig.enabled && shouldRefreshWidget) updateWidget();
 
-    if (transitionLines.length > 0) {
-      const capped = capStatusLines(transitionLines, statusConfig.lineLimit);
+    const statusLines = [...providerStallLines, ...transitionLines];
+    if (statusLines.length > 0) {
+      const capped = capStatusLines(statusLines, statusConfig.lineLimit);
       pi.sendMessage(
         {
           customType: "subagent_status",
-          content: formatStatusAggregate(transitionLines, statusConfig.lineLimit),
+          content: formatStatusAggregate(statusLines, statusConfig.lineLimit),
           display: true,
           details: { lines: capped.visibleLines, overflow: capped.overflow, children: Array.from(runningSubagents.values(), running => ({ id: running.childId, ...childUsageDetails(running.usageDescriptor, pi.events, running.cli) })) },
         },
@@ -1837,6 +1876,8 @@ export const __test__ = {
   shouldNudgeWaitingSubagent,
   maybeNudgeWaitingSubagent,
   maybeMarkStatusUnresponsive,
+  maybeReportProviderStall,
+  shouldStartStatusRefresh,
   runningSubagents,
   formatElapsed,
   formatTokens,

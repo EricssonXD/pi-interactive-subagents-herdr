@@ -1,6 +1,7 @@
 {
   "status": {
-    "enabled": true
+    "enabled": true,
+    "providerStallTimeoutMs": 600000
   },
   "intelligenceLevels": {
     "low": {

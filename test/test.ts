@@ -983,7 +983,12 @@ describe("status.ts", () => {
     assert.deepEqual(disabled, {
       enabled: false,
       lineLimit: 4,
+      providerStallTimeoutMs: 600_000,
     });
+    assert.equal(
+      parseStatusConfig({ status: { enabled: true, providerStallTimeoutMs: 12_000 } }).providerStallTimeoutMs,
+      12_000,
+    );
   });
 
   it("loads a valid config file", () => {
@@ -993,6 +998,7 @@ describe("status.ts", () => {
     assert.deepEqual(config, {
       enabled: true,
       lineLimit: 4,
+      providerStallTimeoutMs: 600_000,
     });
   });
 
@@ -1009,6 +1015,7 @@ describe("status.ts", () => {
       assert.deepEqual(config, {
         enabled: true,
         lineLimit: 4,
+        providerStallTimeoutMs: 600_000,
       });
     });
   });
@@ -1022,6 +1029,12 @@ describe("status.ts", () => {
       () => parseStatusConfig({ status: { enabled: true, defaultCadenceSeconds: 60 } }),
       /status has unsupported key\(s\): defaultCadenceSeconds/,
     );
+    for (const providerStallTimeoutMs of [0, -1, 1.5, "600000"]) {
+      assert.throws(
+        () => parseStatusConfig({ status: { enabled: true, providerStallTimeoutMs } }),
+        /status\.providerStallTimeoutMs must be a positive integer/,
+      );
+    }
   });
 
   it("reports when neither local nor shared config exists", () => {
@@ -3278,6 +3291,149 @@ describe("subagent interruption", () => {
       ...overrides,
     };
   }
+
+  function providerActivity(updatedAt: number, sequence = 1, providerActive = true) {
+    return {
+      version: 1,
+      runningChildId: "a1",
+      createdAt: 0,
+      updatedAt,
+      sequence,
+      latestEvent: "before_provider_request",
+      phase: "active",
+      agentActive: true,
+      turnActive: true,
+      providerActive,
+      toolActive: false,
+      activeScope: "provider",
+      activeSince: updatedAt,
+    };
+  }
+
+  it("starts supervision for running children with visual status disabled", () => {
+    const testApi = (subagentsModule as any).__test__;
+
+    assert.equal(testApi.shouldStartStatusRefresh(false, 1, false), true);
+    assert.equal(testApi.shouldStartStatusRefresh(false, 0, true), true);
+    assert.equal(testApi.shouldStartStatusRefresh(false, 0, false), false);
+    assert.equal(testApi.shouldStartStatusRefresh(true, 0, false), true);
+  });
+
+  it("wakes the parent for a provider stall with visual status disabled, leaving the child running", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const config = testApi.statusConfig;
+    const oldEnabled = config.enabled;
+    const oldTimeout = config.providerStallTimeoutMs;
+    const oldSetInterval = globalThis.setInterval;
+    const oldClearInterval = globalThis.clearInterval;
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    const activityFile = join(dir, "activity.json");
+    const now = Date.now();
+    writeFileSync(activityFile, `${JSON.stringify(providerActivity(now - 2_000))}\n`);
+
+    let tick: (() => void) | undefined;
+    const messages: any[] = [];
+    let sendOptions: any;
+    try {
+      runningMap.clear();
+      config.enabled = false;
+      config.providerStallTimeoutMs = 1_000;
+      globalThis.setInterval = ((callback: () => void) => {
+        tick = callback;
+        return {} as any;
+      }) as any;
+      globalThis.clearInterval = (() => {}) as any;
+
+      const running = makeRunning({ sessionFile, activityFile });
+      runningMap.set(running.id, running);
+      testApi.startStatusRefresh({
+        sendMessage(message: any, options: any) {
+          messages.push(message);
+          sendOptions = options;
+        },
+      });
+
+      assert.equal(typeof tick, "function");
+      tick!();
+      assert.equal(messages.length, 1);
+      assert.equal(messages[0].customType, "subagent_status");
+      assert.match(messages[0].content, /provider may be stalled.*threshold 1s.*child remains running/i);
+      assert.deepEqual(sendOptions, { triggerTurn: true, deliverAs: "steer" });
+      assert.equal(runningMap.get(running.id), running);
+
+      runningMap.clear();
+      tick!();
+    } finally {
+      runningMap.clear();
+      tick?.();
+      config.enabled = oldEnabled;
+      config.providerStallTimeoutMs = oldTimeout;
+      globalThis.setInterval = oldSetInterval;
+      globalThis.clearInterval = oldClearInterval;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a quiet provider request once and resets after new activity", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning({
+      activityRead: { ok: true },
+      activity: providerActivity(1_000),
+    });
+
+    assert.equal(testApi.maybeReportProviderStall(running, 2_000, 1_000), null);
+    const first = testApi.maybeReportProviderStall(running, 2_001, 1_000);
+    assert.match(first, /provider may be stalled.*child remains running/i);
+    assert.equal(testApi.maybeReportProviderStall(running, 2_002, 1_000), null);
+
+    running.activity = providerActivity(3_000, 2);
+    assert.equal(testApi.maybeReportProviderStall(running, 4_000, 1_000), null);
+    assert.match(testApi.maybeReportProviderStall(running, 4_001, 1_000), /provider may be stalled.*child remains running/i);
+  });
+
+  it("keeps provider stall details visible when child names are long", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const running = makeRunning({
+      name: "A very long child name that exceeds the status line width by a lot",
+      activityRead: { ok: true },
+      activity: providerActivity(1_000),
+    });
+    const line = testApi.maybeReportProviderStall(running, 2_001, 1_000);
+    const capped = capStatusLines([line], 4).visibleLines[0];
+
+    assert.ok(capped.length <= 120);
+    assert.match(capped, /provider may be stalled/);
+    assert.match(capped, /child remains running/);
+  });
+
+  it("does not report a provider stall for ineligible activity or terminal sidecars", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const activity = providerActivity(1_000);
+    for (const overrides of [
+      { activityRead: { ok: false } },
+      { activityRead: { ok: true }, activity, cli: "claude" },
+      { activityRead: { ok: true }, activity: providerActivity(1_000, 1, false) },
+      { activityRead: { ok: true }, activity, interactive: true },
+    ]) {
+      assert.equal(testApi.maybeReportProviderStall(makeRunning(overrides), 5_000, 1_000), null);
+    }
+
+    const dir = createTestDir();
+    const sessionFile = join(dir, "child.jsonl");
+    try {
+      for (const suffix of [".complete", ".exit"]) {
+        writeFileSync(`${sessionFile}${suffix}`, "terminal");
+        const running = makeRunning({ activityRead: { ok: true }, activity, sessionFile });
+        assert.equal(testApi.maybeReportProviderStall(running, 5_000, 1_000), null);
+        assert.equal(existsSync(`${sessionFile}${suffix}`), true);
+        rmSync(`${sessionFile}${suffix}`, { force: true });
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
 
   it("registers subagent_message and not the old interrupt/resume tools", () => {
     const { api, registeredTools } = createMockExtensionApi();
